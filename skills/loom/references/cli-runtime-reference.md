@@ -317,10 +317,8 @@ Configure in `.claude/settings.json`.
 {
   "hooks": {
     "PreToolUse": [{
-      "hooks": [{
-        "type": "command",
-        "command": "jq -c '{ts: now|todate, tool: .tool_name}' >> ~/claude-audit.log"
-      }]
+      "type": "command",
+      "command": "jq -c '{ts: now|todate, tool: .tool_name}' >> ~/claude-audit.log"
     }]
   }
 }

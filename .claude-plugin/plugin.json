@@ -1,6 +1,6 @@
 {
   "name": "loom",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Build applications where Claude Code CLI (claude -p) is the runtime — a server spawns Claude processes that read files, run commands, and return structured output, while a custom interface renders the results.",
   "author": {
     "name": "Marcus Estes"

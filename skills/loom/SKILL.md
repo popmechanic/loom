@@ -135,7 +135,10 @@ Web apps add security concerns that CLIs don't have:
 - **Auth**: Who can access this? Do you need user accounts?
 - **Sandboxing**: Claude has filesystem access — what directory should it be scoped to?
 - **Cost**: Each request costs money — do you need rate limiting? Budget caps (`--max-budget-usd`)?
-- **Permissions**: Use the tightest `--permission-mode` and `--allowedTools` that work
+- **Permissions**: Use the tightest `--permission-mode` and `--allowedTools` that work.
+  Prefer `dontAsk` (auto-denies unallowed tools) over `bypassPermissions` (skips all checks).
+  Only use `bypassPermissions` when `--allowedTools` fully constrains Claude's capabilities
+  and you need unattended execution in a trusted environment (CI/CD, local dev tools).
 - **Multi-tenancy**: If multiple users, each needs isolated sessions and working directories
 
 ### 6. Model and performance
@@ -162,13 +165,42 @@ The server's job is simple: receive HTTP requests, spawn Claude, return results.
 Read `references/cli-runtime-reference.md` for the full `claude -p` flag reference.
 Here are the server patterns to reach for:
 
+#### Safety Defaults
+
+Every pattern below runs Claude in a server — no human sitting at a terminal
+to approve tool use or notice runaway costs. Three flags are non-negotiable:
+
+**`--permission-mode dontAsk`** — In a server context, there's nobody to click
+"approve." Without this flag, Claude hangs forever waiting for interactive
+input. `dontAsk` auto-denies any tool not in `--allowedTools`, which is exactly
+what you want: predictable, unattended execution.
+
+**`--max-budget-usd`** — Every HTTP request that spawns Claude is an open
+checkbook. Set a hard cap: `0.50` for quick analysis with haiku, `1` for
+typical sonnet tasks, `3–5` for complex multi-turn sessions. Adjust to your
+use case, but never omit it.
+
+**`--max-turns`** — Defense in depth alongside the budget cap. Prevents
+conversational loops where Claude keeps trying approaches that won't work.
+`5` for one-shot tasks, `10–15` for streaming, `20` for multi-turn sessions.
+
+Every pattern also handles three failure modes:
+
+- **stderr** — Claude writes warnings, errors, and diagnostics here. Always
+  capture it; it's your best debugging signal when something goes wrong.
+- **Non-zero exit codes** — Model overloaded, budget exhausted, permission
+  denied, timeout hit. `execFileSync` throws; `spawn` emits a `close` event.
+- **Malformed output** — A killed or timed-out process may emit partial JSON.
+  Always wrap JSON.parse in try/catch and check `parsed.is_error` before
+  using `structured_output`.
+
 #### Pattern: REST Endpoint (One-Shot)
 
 Someone triggers an action → server calls Claude → returns JSON.
 
 ```typescript
 import express from "express";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 
 const app = express();
 app.use(express.json());
@@ -192,13 +224,24 @@ app.post("/api/analyze", (req, res) => {
     required: ["findings", "summary"]
   });
 
-  const result = execSync(
-    `claude -p --model sonnet --output-format json --json-schema '${schema}' --tools "" --no-session-persistence`,
-    { input: `${task}\n\n${content}`, encoding: "utf-8", timeout: 60000 }
-  );
+  try {
+    const result = execFileSync("claude", [
+      "-p", "--model", "sonnet", "--output-format", "json",
+      "--permission-mode", "dontAsk", "--max-budget-usd", "1",
+      "--json-schema", schema, "--tools", "", "--no-session-persistence"
+    ], { input: `${task}\n\n${content}`, encoding: "utf-8", timeout: 60000 });
 
-  const { structured_output, total_cost_usd } = JSON.parse(result);
-  res.json({ ...structured_output, cost: total_cost_usd });
+    const parsed = JSON.parse(result);
+    if (parsed.is_error) {
+      return res.status(502).json({ error: parsed.result });
+    }
+    res.json({ ...parsed.structured_output, cost: parsed.total_cost_usd });
+  } catch (e: any) {
+    // execFileSync throws on non-zero exit and timeout
+    const stderr = e.stderr?.toString().trim();
+    console.error(`[claude] exit ${e.status}, stderr: ${stderr}`);
+    res.status(502).json({ error: stderr || "Claude process failed" });
+  }
 });
 ```
 
@@ -206,9 +249,13 @@ app.post("/api/analyze", (req, res) => {
 
 Someone triggers a task → server streams Claude's output token-by-token.
 
+Use `app.post` for CSRF safety — task data stays in the body instead of the URL.
+(`app.get` works for quick prototyping with `EventSource`, but `EventSource` only
+supports GET, so switch to `fetch()` + `ReadableStream` on the client for POST.)
+
 ```typescript
-app.get("/api/stream", (req, res) => {
-  const { task } = req.query;
+app.post("/api/stream", (req, res) => {
+  const { task } = req.body;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -220,8 +267,9 @@ app.get("/api/stream", (req, res) => {
 
   const proc = spawn("claude", [
     "-p", "--output-format", "stream-json", "--verbose",
+    "--permission-mode", "dontAsk", "--max-budget-usd", "2", "--max-turns", "15",
     "--model", "sonnet", "--no-session-persistence",
-    task as string
+    task
   ], { env: cleanEnv });
 
   proc.stdout.on("data", (chunk) => {
@@ -233,11 +281,28 @@ app.get("/api/stream", (req, res) => {
         } else if (event.type === "result") {
           res.write(`data: ${JSON.stringify({ type: "done", cost: event.total_cost_usd })}\n\n`);
         }
-      } catch {}
+      } catch (e) {
+        // Skip malformed JSON lines — expected for partial stream chunks
+      }
     }
   });
 
-  proc.on("close", () => res.end());
+  proc.stderr.on("data", (chunk) => {
+    console.error(`[claude stderr] ${chunk.toString().trim()}`);
+  });
+
+  proc.on("close", (code) => {
+    if (code !== 0) {
+      res.write(`data: ${JSON.stringify({ type: "error", message: `Claude exited with code ${code}` })}\n\n`);
+    }
+    res.end();
+  });
+
+  proc.on("error", (err) => {
+    res.write(`data: ${JSON.stringify({ type: "error", message: err.message })}\n\n`);
+    res.end();
+  });
+
   req.on("close", () => proc.kill());
 });
 ```
@@ -248,28 +313,31 @@ Persistent connection with multi-turn conversation and streaming.
 
 ```typescript
 import { WebSocketServer } from "ws";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { v4 as uuidv4 } from "uuid";
 
 const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (ws) => {
   const sessionId = uuidv4();
+  let activeProc: ChildProcess | null = null;
 
   ws.on("message", (raw) => {
     const { action, payload } = JSON.parse(raw.toString());
 
-    const args = [
-      "-p", "--output-format", "stream-json", "--verbose",
-      "--session-id", sessionId, "--continue",
-      "--model", "sonnet"
-    ];
-
     const cleanEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.startsWith("CLAUDE"))
-  );
+      Object.entries(process.env).filter(([k]) => !k.startsWith("CLAUDE"))
+    );
 
-    const proc = spawn("claude", [...args, payload.prompt], { env: cleanEnv });
+    const proc = spawn("claude", [
+      "-p", "--output-format", "stream-json", "--verbose",
+      "--permission-mode", "dontAsk", "--max-budget-usd", "3", "--max-turns", "20",
+      "--session-id", sessionId, "--continue",
+      "--model", "sonnet",
+      payload.prompt
+    ], { env: cleanEnv });
+
+    activeProc = proc;
 
     proc.stdout.on("data", (chunk) => {
       for (const line of chunk.toString().split("\n").filter(Boolean)) {
@@ -280,9 +348,31 @@ wss.on("connection", (ws) => {
           } else if (event.type === "result") {
             ws.send(JSON.stringify({ type: "done", result: event }));
           }
-        } catch {}
+        } catch (e) {
+          // Skip malformed JSON lines — expected for partial stream chunks
+        }
       }
     });
+
+    proc.stderr.on("data", (chunk) => {
+      console.error(`[claude stderr] ${chunk.toString().trim()}`);
+    });
+
+    proc.on("close", (code) => {
+      activeProc = null;
+      if (code !== 0) {
+        ws.send(JSON.stringify({ type: "error", message: `Claude exited with code ${code}` }));
+      }
+    });
+
+    proc.on("error", (err) => {
+      activeProc = null;
+      ws.send(JSON.stringify({ type: "error", message: err.message }));
+    });
+  });
+
+  ws.on("close", () => {
+    if (activeProc) activeProc.kill();
   });
 });
 ```
@@ -292,14 +382,13 @@ wss.on("connection", (ws) => {
 Long-running task that reports progress.
 
 ```typescript
-const jobs = new Map<string, { status: string; result?: any }>();
+const jobs = new Map<string, { status: string; result?: any; error?: string }>();
 
 app.post("/api/jobs", (req, res) => {
   const jobId = uuidv4();
   jobs.set(jobId, { status: "running" });
   res.json({ jobId });
 
-  // Run Claude in background
   const cleanEnv = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !k.startsWith("CLAUDE"))
   );
@@ -307,13 +396,15 @@ app.post("/api/jobs", (req, res) => {
   const proc = spawn("claude", [
     "-p", "--output-format", "stream-json", "--verbose",
     "--model", "sonnet", "--max-turns", "20", "--max-budget-usd", "5",
-    "--permission-mode", "bypassPermissions",
+    "--permission-mode", "dontAsk",
     "--tools", "Read,Bash,Glob,Grep",
     "--no-session-persistence"
   ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv });
 
   proc.stdin.write(req.body.task);
   proc.stdin.end();
+
+  let stderrBuf = "";
 
   proc.stdout.on("data", (chunk) => {
     for (const line of chunk.toString().split("\n").filter(Boolean)) {
@@ -322,8 +413,24 @@ app.post("/api/jobs", (req, res) => {
         if (event.type === "result") {
           jobs.set(jobId, { status: "complete", result: event });
         }
-      } catch {}
+      } catch (e) {
+        // Skip malformed JSON lines — expected for partial stream chunks
+      }
     }
+  });
+
+  proc.stderr.on("data", (chunk) => {
+    stderrBuf += chunk.toString();
+  });
+
+  proc.on("close", (code) => {
+    if (code !== 0 && jobs.get(jobId)?.status === "running") {
+      jobs.set(jobId, { status: "failed", error: stderrBuf.trim() || `Exit code ${code}` });
+    }
+  });
+
+  proc.on("error", (err) => {
+    jobs.set(jobId, { status: "failed", error: err.message });
   });
 });
 
@@ -335,20 +442,54 @@ app.get("/api/jobs/:id", (req, res) => {
 
 #### Pattern: Parallel Analysis
 
-Analyze multiple items concurrently, aggregate results.
+Analyze multiple items concurrently, aggregate results. Uses `spawn` so each
+Claude process runs in its own child process — truly parallel.
 
 ```typescript
 app.post("/api/batch", async (req, res) => {
   const { items, task } = req.body;
+  const TIMEOUT_MS = 30000;
 
-  const results = await Promise.all(
-    items.map((item: string) => new Promise<any>((resolve) => {
-      const result = execSync(
-        `claude -p --model haiku --output-format json --json-schema '${schema}' --tools "" --no-session-persistence`,
-        { input: `${task}\n\n${item}`, encoding: "utf-8", timeout: 30000 }
-      );
-      resolve(JSON.parse(result).structured_output);
+  const cleanEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith("CLAUDE"))
+  );
+
+  const outcomes = await Promise.allSettled(
+    items.map((item: string) => new Promise<any>((resolve, reject) => {
+      const proc = spawn("claude", [
+        "-p", "--model", "haiku", "--output-format", "json",
+        "--permission-mode", "dontAsk", "--max-budget-usd", "0.50",
+        "--json-schema", schema, "--tools", "", "--no-session-persistence"
+      ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv });
+
+      const timeout = setTimeout(() => { proc.kill(); reject(new Error("Timeout")); }, TIMEOUT_MS);
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdin.write(`${task}\n\n${item}`);
+      proc.stdin.end();
+      proc.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+      proc.on("close", (code) => {
+        clearTimeout(timeout);
+        try {
+          const parsed = JSON.parse(stdout);
+          if (parsed.is_error) reject(new Error(parsed.result));
+          else resolve(parsed.structured_output);
+        } catch (e) {
+          reject(new Error(stderr.trim() || `Exit code ${code}`));
+        }
+      });
+
+      proc.on("error", (err) => { clearTimeout(timeout); reject(err); });
     }))
+  );
+
+  const results = outcomes.map((o, i) =>
+    o.status === "fulfilled"
+      ? { item: items[i], data: o.value }
+      : { item: items[i], error: o.reason.message }
   );
 
   res.json({ results });
@@ -361,18 +502,48 @@ The frontend renders Claude's output as purpose-built UI, not chat bubbles.
 
 #### Streaming Text Display
 
+`fetch()` + `ReadableStream` supports POST (CSRF-safe, keeps task data out of URLs).
+Use this as the default pattern for production apps.
+
+```javascript
+async function streamTask(task) {
+  const output = document.getElementById("output");
+
+  const response = await fetch("/api/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task })
+  });
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n\n");
+    buffer = lines.pop(); // keep incomplete chunk
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = JSON.parse(line.slice(6));
+      if (data.type === "token") output.textContent += data.text;
+      else if (data.type === "done") document.getElementById("cost").textContent = `$${data.cost.toFixed(4)}`;
+      else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
+    }
+  }
+}
+```
+
+For quick prototypes, `EventSource` is simpler but limited to GET:
+
 ```javascript
 const source = new EventSource(`/api/stream?task=${encodeURIComponent(task)}`);
-const output = document.getElementById("output");
-
 source.onmessage = (e) => {
   const data = JSON.parse(e.data);
-  if (data.type === "token") {
-    output.textContent += data.text;
-  } else if (data.type === "done") {
-    source.close();
-    document.getElementById("cost").textContent = `$${data.cost.toFixed(4)}`;
-  }
+  if (data.type === "token") output.textContent += data.text;
+  else if (data.type === "done") source.close();
 };
 ```
 
@@ -381,15 +552,92 @@ source.onmessage = (e) => {
 ```javascript
 // Claude returns structured data via JSON schema
 // Render it as whatever UI makes sense — not a chat message
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
 function renderResults(data) {
   return data.items.map(item => `
-    <div class="item item--${item.type}">
-      <h3>${item.title}</h3>
-      <p>${item.description}</p>
+    <div class="item item--${esc(item.type)}">
+      <h3>${esc(item.title)}</h3>
+      <p>${esc(item.description)}</p>
     </div>
   `).join("");
 }
 ```
+
+### Error Handling
+
+Every pattern above handles errors inline — you won't find a separate error
+handling block to copy-paste because it doesn't belong in one. Here's the
+mental model behind the three failure modes:
+
+**stderr** fires first. Claude writes diagnostics, warnings, and model errors
+here before the process exits. Always pipe it somewhere — `console.error` at
+minimum. In production, send it to your logging stack. This is your primary
+debugging signal when a request fails silently.
+
+**Non-zero exit codes** mean Claude didn't complete successfully. Common
+causes: model overloaded (503 from upstream), budget exhausted (`--max-budget-usd`
+hit), permission denied (tool not in `--allowedTools`), or process killed
+by your timeout. For `execFileSync`, this throws — catch it. For `spawn`,
+listen on the `close` event and check the code.
+
+**Malformed output** happens when a process is killed mid-stream (timeout,
+client disconnect, OOM). The stdout buffer contains partial JSON that won't
+parse. Always wrap `JSON.parse` in try/catch, and always check `parsed.is_error`
+before reaching for `structured_output` — Claude sets this flag when it
+couldn't complete the task (budget exhausted mid-run, tool failures, etc.).
+
+### Input Validation
+
+When a Loom app accepts file paths or user-provided prompts, validate at the
+boundary — before anything reaches Claude.
+
+For paths, reject directory traversal. A simple helper:
+
+```typescript
+import path from "path";
+
+function safePath(base: string, userPath: string): string {
+  const resolved = path.resolve(base, userPath);
+  if (!resolved.startsWith(path.resolve(base) + path.sep)) {
+    throw new Error("Path traversal blocked");
+  }
+  return resolved;
+}
+```
+
+For prompts, the best defense is structural: use `--json-schema` to constrain
+Claude's output shape and `--allowedTools` to limit what it can do. This
+reduces the blast radius of prompt injection — even if the prompt is
+adversarial, Claude can only produce data matching your schema and can only
+use the tools you allowed.
+
+### Temp Directory Cleanup
+
+If your app writes temporary files for Claude to analyze (uploaded content,
+generated artifacts), clean up after each request:
+
+```typescript
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import path from "path";
+
+async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(path.join(tmpdir(), "loom-"));
+  try {
+    return await fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+```
+
+For long-running servers, consider a periodic sweep of your temp directory
+to catch orphaned files from crashed requests.
 
 ## What to Generate
 

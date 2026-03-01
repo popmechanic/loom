@@ -28,8 +28,12 @@ The server is a thin relay. Claude does the work. Your interface gives it form.
 
 ## Installation
 
+Either:
 ```
 /install-plugin popmechanic/loom
+```
+or:
+```
 /plugin install loom
 ```
 
