@@ -26,6 +26,8 @@ Three decisions define each app:
 
 The server is a thin relay. Claude does the work. Your interface gives it form.
 
+For a deeper walkthrough of the architecture, patterns, and design decisions, open the [interactive explainer](explainer.html).
+
 ## Installation
 
 Either:
