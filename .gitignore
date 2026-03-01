@@ -1,0 +1,6 @@
+commit-storyteller/
+cli-app-workspace/
+*.skill
+.DS_Store
+node_modules/
+.claude/settings.local.json

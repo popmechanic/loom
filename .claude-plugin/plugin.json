@@ -1,0 +1,9 @@
+{
+  "name": "cli-app",
+  "version": "1.0.0",
+  "description": "Build web applications that use Claude Code CLI (claude -p) as the runtime — servers spawn Claude processes while custom frontends render structured output as rich UI.",
+  "author": {
+    "name": "Marcus Estes"
+  },
+  "license": "MIT"
+}
