@@ -368,3 +368,413 @@ function deriveAndSendRPC(
       break;
   }
 }
+```
+
+## Patterns
+
+### Pattern 1: Synchronous (Quick Extraction)
+
+The simplest pattern. The webview sends a `startTask` request, Bun spawns
+Claude, collects the full output, and returns the result. No streaming — the
+webview waits for the response.
+
+Use this for fast, structured extraction: pull metadata from a file, classify
+a document, extract TODOs from a codebase.
+
+**Bun-side handler:**
+
+```typescript
+import { BrowserView } from "electrobun/bun";
+
+const rpc = BrowserView.defineRPC<LoomRPC>({
+  handlers: {
+    startTask: async ({ prompt, model, tools, maxBudget }) => {
+      const taskId = crypto.randomUUID();
+
+      const schema = JSON.stringify({
+        type: "object",
+        properties: {
+          result: { type: "string" },
+          items: { type: "array", items: { type: "object" } },
+        },
+        required: ["result"],
+      });
+
+      try {
+        const proc = Bun.spawnSync([
+          "claude", "-p",
+          "--output-format", "json",
+          "--permission-mode", "dontAsk",
+          "--tools", (tools || []).join(","),
+          "--model", model || "sonnet",
+          "--max-budget-usd", String(maxBudget || 1),
+          "--json-schema", schema,
+          "--no-session-persistence",
+          prompt,
+        ], { env: cleanEnv(), timeout: 60000 });
+
+        if (proc.exitCode !== 0) {
+          const stderr = proc.stderr.toString().trim();
+          rpc.send.error({ taskId, message: stderr || `Exit code ${proc.exitCode}` });
+          return { taskId };
+        }
+
+        const parsed = JSON.parse(proc.stdout.toString());
+        if (parsed.is_error) {
+          rpc.send.error({ taskId, message: parsed.result });
+        } else {
+          rpc.send.token({ taskId, text: parsed.result });
+          rpc.send.done({
+            taskId,
+            cost: parsed.total_cost_usd ?? 0,
+            duration: parsed.duration_ms ?? 0,
+          });
+        }
+      } catch (err: any) {
+        rpc.send.error({ taskId, message: err.message });
+      }
+
+      return { taskId };
+    },
+    abort: async () => ({ success: false }), // Can't abort sync
+  },
+});
+```
+
+The `--json-schema` flag gives you typed `structured_output` alongside the
+narrative `result`. Design the schema to match the UI components you want to
+render — the schema IS your API contract between Claude and the frontend.
+
+**Don't do this:**
+- Don't use string interpolation to build the command — use an args array.
+  Shell strings break on special characters and are injection-vulnerable.
+- Don't read `structured_output` without checking `is_error` first — when
+  Claude hits a budget cap or tool failure, `structured_output` is `null`.
+
+### Pattern 2: Streaming (Primary Pattern)
+
+The Thin Bridge. This is the core pattern for most Loom desktop apps. Tokens
+flow from Claude's stdout through the Bun process to the webview as typed RPC
+messages, with status heartbeats every 2 seconds.
+
+**Bun-side: Claude Manager**
+
+The complete `spawnClaude()` function. This is the heart of the bridge:
+
+```typescript
+import { BrowserView } from "electrobun/bun";
+
+// Active tasks for abort support
+const activeTasks = new Map<string, {
+  proc: ReturnType<typeof Bun.spawn>;
+  heartbeat: ReturnType<typeof setInterval>;
+}>();
+
+function spawnClaude(
+  taskId: string,
+  prompt: string,
+  opts: {
+    model?: string;
+    tools?: string[];
+    maxBudget?: number;
+    sessionId?: string;
+  },
+  rpc: any
+) {
+  // Heartbeat state
+  let currentState: LoomRPC["webview"]["messages"]["status"]["state"] = "spawning";
+  let lastToolName = "";
+  let lastOutputTime = Date.now();
+  const startTime = Date.now();
+
+  // Build args
+  const args = [
+    "-p",
+    "--output-format", "stream-json", "--verbose",
+    "--permission-mode", "dontAsk",
+    "--tools", (opts.tools || []).join(","),
+    "--model", opts.model || "sonnet",
+    "--max-budget-usd", String(opts.maxBudget || 1),
+    "--no-session-persistence",
+  ];
+  if (opts.sessionId) {
+    args.push("--session-id", opts.sessionId, "--continue");
+  }
+  args.push(prompt);
+
+  // Spawn
+  const proc = Bun.spawn(["claude", ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: cleanEnv(),
+  });
+
+  // Status heartbeat — every 2 seconds while the task runs
+  const heartbeat = setInterval(() => {
+    rpc.send.status({
+      taskId,
+      state: currentState,
+      detail: currentState === "tool_use" ? lastToolName : undefined,
+      elapsedMs: Date.now() - startTime,
+      lastActivityMs: Date.now() - lastOutputTime,
+    });
+  }, 2000);
+
+  // Track for abort
+  activeTasks.set(taskId, { proc, heartbeat });
+
+  // Parse stdout stream
+  const parse = createStreamParser((event) => {
+    lastOutputTime = Date.now();
+
+    switch (event.type) {
+      case "system":
+        currentState = "running";
+        break;
+
+      case "assistant": {
+        const msg = event.message;
+        if (!msg?.content) break;
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            rpc.send.token({ taskId, text: block.text });
+            currentState = "running";
+          } else if (block.type === "tool_use") {
+            rpc.send.toolUse({ taskId, tool: block.name, input: block.input });
+            currentState = "tool_use";
+            lastToolName = block.name;
+          }
+        }
+        break;
+      }
+
+      case "stream_event": {
+        const delta = event.event?.delta;
+        if (delta?.text) {
+          rpc.send.token({ taskId, text: delta.text });
+          currentState = "running";
+        }
+        break;
+      }
+
+      case "tool_result": {
+        const content = event.content ?? event.message?.content;
+        const text = typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.map((b: any) => b.text ?? "").join("")
+            : JSON.stringify(content);
+        rpc.send.toolResult({
+          taskId,
+          tool: lastToolName,
+          output: text.slice(0, 10000),
+          isError: !!event.is_error,
+        });
+        currentState = "running";
+        break;
+      }
+
+      case "result":
+        rpc.send.done({
+          taskId,
+          cost: event.total_cost_usd ?? 0,
+          duration: event.duration_ms ?? 0,
+        });
+        cleanup();
+        break;
+    }
+  });
+
+  function cleanup() {
+    clearInterval(heartbeat);
+    activeTasks.delete(taskId);
+    currentState = "idle";
+  }
+
+  // Pump stdout reader
+  (async () => {
+    const reader = proc.stdout.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parse(value);
+      }
+    } catch (err) {
+      // Reader closed — process exited
+    }
+
+    // Process finished — check for errors
+    const exitCode = await proc.exited;
+    if (exitCode !== 0 && currentState !== "idle") {
+      const stderr = await new Response(proc.stderr).text();
+      rpc.send.error({
+        taskId,
+        message: stderr.trim() || `Claude exited with code ${exitCode}`,
+      });
+    }
+    cleanup();
+  })();
+
+  return proc;
+}
+```
+
+**Bun-side: Request handlers**
+
+Wire the RPC to `spawnClaude`:
+
+```typescript
+const rpc = BrowserView.defineRPC<LoomRPC>({
+  handlers: {
+    startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
+      const taskId = crypto.randomUUID();
+      spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId }, rpc);
+      return { taskId };
+    },
+    abort: async ({ taskId }) => {
+      const task = activeTasks.get(taskId);
+      if (!task) return { success: false };
+
+      task.proc.kill("SIGTERM");
+      clearInterval(task.heartbeat);
+      activeTasks.delete(taskId);
+      rpc.send.error({ taskId, message: "Task aborted by user" });
+      return { success: true };
+    },
+  },
+});
+```
+
+**Webview-side: Receiving messages**
+
+The frontend registers handlers for each message type. Here's a minimal React
+component that renders streaming tokens with status:
+
+```tsx
+import { useState, useEffect, useRef } from "react";
+import { Electroview } from "electrobun/view";
+
+const electrobun = new Electroview<LoomRPC>();
+
+function App() {
+  const [output, setOutput] = useState("");
+  const [status, setStatus] = useState<string>("idle");
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [cost, setCost] = useState<number | null>(null);
+  const [tools, setTools] = useState<string[]>([]);
+  const outputRef = useRef<HTMLPreElement>(null);
+
+  useEffect(() => {
+    electrobun.rpc.on.token(({ taskId: tid, text }) => {
+      setOutput((prev) => prev + text);
+    });
+
+    electrobun.rpc.on.toolUse(({ tool }) => {
+      setTools((prev) => [...prev, tool]);
+    });
+
+    electrobun.rpc.on.toolResult(({ tool, isError }) => {
+      setTools((prev) => prev.filter((t) => t !== tool));
+    });
+
+    electrobun.rpc.on.status(({ state, detail, elapsedMs }) => {
+      const secs = Math.round(elapsedMs / 1000);
+      setStatus(detail ? `${state}: ${detail} (${secs}s)` : `${state} (${secs}s)`);
+    });
+
+    electrobun.rpc.on.done(({ cost: c, duration }) => {
+      setCost(c);
+      setStatus(`Done in ${Math.round(duration / 1000)}s`);
+      setTaskId(null);
+    });
+
+    electrobun.rpc.on.error(({ message }) => {
+      setStatus(`Error: ${message}`);
+      setTaskId(null);
+    });
+  }, []);
+
+  useEffect(() => {
+    // Auto-scroll output
+    if (outputRef.current) {
+      outputRef.current.scrollTop = outputRef.current.scrollHeight;
+    }
+  }, [output]);
+
+  async function runTask(prompt: string) {
+    setOutput("");
+    setCost(null);
+    setStatus("spawning...");
+    const { taskId: tid } = await electrobun.rpc.request.startTask({
+      prompt,
+      model: "sonnet",
+      tools: ["Read", "Glob", "Grep"],
+      maxBudget: 1,
+    });
+    setTaskId(tid);
+  }
+
+  async function abort() {
+    if (taskId) {
+      await electrobun.rpc.request.abort({ taskId });
+    }
+  }
+
+  return (
+    <div className="app">
+      <header>
+        <input
+          type="text"
+          placeholder="What should Claude do?"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") runTask(e.currentTarget.value);
+          }}
+          disabled={!!taskId}
+        />
+        <button onClick={abort} disabled={!taskId}>Abort</button>
+      </header>
+
+      <div className="status-bar">
+        {status}
+        {tools.length > 0 && <span className="tools">Using: {tools.join(", ")}</span>}
+        {cost !== null && <span className="cost">${cost.toFixed(4)}</span>}
+      </div>
+
+      <pre className="output" ref={outputRef}>{output}</pre>
+    </div>
+  );
+}
+
+export default App;
+```
+
+**Startup CLI check**
+
+On app launch, verify Claude is accessible before showing the main UI:
+
+```typescript
+// In src/bun/index.ts, before creating the window:
+function checkClaudeCLI(): boolean {
+  try {
+    const result = Bun.spawnSync(["claude", "--version"]);
+    return result.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+const claudeAvailable = checkClaudeCLI();
+
+const win = new BrowserWindow({
+  title: "My Claude App",
+  frame: { width: 1200, height: 800 },
+  url: claudeAvailable
+    ? "views://mainview/index.html"
+    : "views://mainview/setup.html",  // Show install instructions
+  rpc,
+});
+```
+
+If Claude isn't found, show a setup screen with install instructions. Don't
+silently fail — the user needs to know why the app isn't working.
