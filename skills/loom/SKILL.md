@@ -111,6 +111,11 @@ Map each action to what Claude needs behind the scenes:
 
 - **What tools?** Read-only analysis (`Read,Glob,Grep`) vs. modification (`Write,Edit,Bash`)
   vs. no tools at all (`--tools ""` for pure reasoning)
+- **What persona?** `--system-prompt "You are..."` replaces the default system prompt
+  entirely — use this for character personas, branded assistants, or any app where
+  Claude should NOT inherit the user's CLAUDE.md settings. `--append-system-prompt`
+  adds to the default prompt (preserving user settings, skills, etc.) — use this
+  when Claude should still act as a general assistant with extra instructions.
 - **What data?** Files on the server? User-uploaded content? Piped from other services?
 - **What output shape?** Free text for display? Structured JSON for rendering UI components?
   Both (use `--json-schema` for structured + `result` for narrative)?
@@ -213,11 +218,26 @@ development), two environment variables — `CLAUDECODE` and
 processes. Remove exactly these two. Do NOT filter all `CLAUDE*` vars — that
 kills auth tokens (`CLAUDE_CODE_OAUTH_TOKEN`) and feature flags.
 
+If the server runs inside **cmux** (the Claude terminal app), additional
+`CMUX_*` surface identifiers trigger nesting detection and cause the spawned
+process to receive SIGTERM immediately. These are terminal-state vars, not
+auth — safe to remove. Detect cmux via `CMUX_SURFACE_ID` and strip only the
+identifiers that trigger detection, leaving port/integration vars intact.
+
 ```typescript
 function cleanEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
+  // cmux terminal sets CMUX_* vars that trigger nesting detection.
+  // These are terminal-state identifiers, not auth tokens — safe to remove.
+  if (env.CMUX_SURFACE_ID) {
+    delete env.CMUX_SURFACE_ID;
+    delete env.CMUX_PANEL_ID;
+    delete env.CMUX_TAB_ID;
+    delete env.CMUX_WORKSPACE_ID;
+    delete env.CMUX_SOCKET_PATH;
+  }
   return env;
 }
 ```
@@ -267,9 +287,7 @@ app.use(express.json());
 app.post("/api/analyze", (req, res) => {
   const { content, task } = req.body;
 
-  const env = { ...process.env };
-  delete env.CLAUDECODE;       // triggers nested-session detection
-  delete env.CMUX_SURFACE_ID;  // triggers cmux hook injection
+  const env = cleanEnv();
 
   const schema = JSON.stringify({
     type: "object",
@@ -314,8 +332,8 @@ app.post("/api/analyze", (req, res) => {
   are injection-vulnerable, and fail silently on quoting errors.
 - Don't read `structured_output` without checking `is_error` first — when
   Claude hits a budget cap or tool failure, `structured_output` is `null`.
-- Don't skip env cleanup — delete `CLAUDECODE` and `CMUX_SURFACE_ID` before
-  spawning. Do NOT strip all `CLAUDE_*` vars; some are required for auth.
+- Don't skip env cleanup — always use `cleanEnv()` before spawning.
+  Do NOT strip all `CLAUDE_*` vars; some are required for auth.
 
 #### Pattern: SSE Streaming
 
@@ -347,17 +365,25 @@ app.post("/api/stream", (req, res) => {
     task
   ], { env: cleanEnv() });
 
+  let gotResult = false;
+
   const parse = createStreamParser((event) => {
+    // Handle both streaming patterns:
+    // 1. Models with extended thinking (haiku-4.5) deliver text as complete
+    //    blocks in "assistant" events — no incremental stream_event tokens.
+    // 2. Other models may emit "stream_event" with incremental deltas.
     if (event.type === "assistant" && event.message?.content) {
       for (const block of event.message.content) {
-        if (block.type === "tool_use") {
+        if (block.type === "text" && block.text) {
+          res.write(`data: ${JSON.stringify({ type: "token", text: block.text })}\n\n`);
+        } else if (block.type === "tool_use") {
           res.write(`data: ${JSON.stringify({ type: "tool", name: block.name })}\n\n`);
         }
       }
-    }
-    if (event.event?.delta?.text) {
+    } else if (event.type === "stream_event" && event.event?.delta?.text) {
       res.write(`data: ${JSON.stringify({ type: "token", text: event.event.delta.text })}\n\n`);
     } else if (event.type === "result") {
+      gotResult = true;
       res.write(`data: ${JSON.stringify({ type: "done", cost: event.total_cost_usd })}\n\n`);
     }
   });
@@ -371,8 +397,10 @@ app.post("/api/stream", (req, res) => {
 
   proc.on("close", (code) => {
     clearInterval(heartbeat);
-    if (code !== 0) {
-      res.write(`data: ${JSON.stringify({ type: "error", message: `Claude exited with code ${code}` })}\n\n`);
+    if (!gotResult) {
+      res.write(`data: ${JSON.stringify({ type: "error", message: code !== 0
+        ? `Claude exited with code ${code}`
+        : "Process finished without producing a result" })}\n\n`);
     }
     res.end();
   });
@@ -383,11 +411,19 @@ app.post("/api/stream", (req, res) => {
     res.end();
   });
 
-  req.on("close", () => { clearInterval(heartbeat); proc.kill(); });
+  // IMPORTANT: Use res.on("close"), NOT req.on("close").
+  // req "close" fires prematurely on POST-based SSE endpoints, killing the
+  // spawned process before it can respond. res "close" fires only when the
+  // client actually disconnects.
+  res.on("close", () => { clearInterval(heartbeat); if (!proc.killed) proc.kill(); });
 });
 ```
 
 **Don't do this:**
+- Don't use `req.on("close")` for SSE cleanup — use `res.on("close")`.
+  `req` "close" fires prematurely on POST-based SSE endpoints, killing the
+  spawned Claude process before it can respond. This causes silent SIGTERM
+  on every request. `res` "close" fires only when the client disconnects.
 - Don't split on `\n` without buffering the last incomplete line — stream
   chunks can split a JSON line across two `data` events, causing silent
   data loss and intermittent `JSON.parse` failures.
@@ -396,6 +432,9 @@ app.post("/api/stream", (req, res) => {
   gets no signal that something went wrong.
 - Don't ignore `is_error` on the result — budget caps and tool failures
   set `is_error: true` with `structured_output: null`.
+- Don't assume text arrives via `stream_event` only — models with extended
+  thinking (haiku-4.5) deliver text as complete blocks in `assistant` events.
+  Always handle both `assistant` text blocks and `stream_event` deltas.
 
 #### Pattern: WebSocket Session
 
@@ -438,14 +477,16 @@ wss.on("connection", (ws) => {
     const parse = createStreamParser((event) => {
       if (event.type === "assistant" && event.message?.content) {
         for (const block of event.message.content) {
-          if (block.type === "tool_use") {
+          if (block.type === "text" && block.text) {
+            ws.send(JSON.stringify({ type: "token", text: block.text }));
+          } else if (block.type === "tool_use") {
             ws.send(JSON.stringify({ type: "tool", name: block.name, input: block.input }));
           }
         }
-      }
-      if (event.event?.delta?.text) {
+      } else if (event.type === "stream_event" && event.event?.delta?.text) {
         ws.send(JSON.stringify({ type: "token", text: event.event.delta.text }));
       } else if (event.type === "result") {
+        gotResult = true;
         ws.send(JSON.stringify({ type: "done", result: event }));
       }
     });
@@ -607,18 +648,25 @@ to the frontend:
 |------------|-------|---------------|----------|
 | `system` | `{type:"system", subtype:"init", session_id, model}` | Session started, model identified | Optional (show model) |
 | `stream_event` | `{type:"stream_event", event:{delta:{text}}}` | Incremental token | Yes (live text) |
-| `assistant` | `{type:"assistant", message:{content:[...]}}` | Complete message block with text and tool_use | Yes (tool progress) |
+| `assistant` | `{type:"assistant", message:{content:[...]}}` | Complete message block with text and tool_use | Yes (text + tool progress) |
 | `tool_result` | `{type:"tool_result", tool_name, content, is_error}` | Tool completed | Optional (show result) |
 | `result` | `{type:"result", total_cost_usd, usage, is_error}` | Session complete | Yes (done + cost) |
 | `compact` | `{type:"compact"}` | Context window compacted | No (internal) |
 
-**Extracting tool use from `assistant` events:**
+**Important: extended thinking changes the streaming pattern.** Models with
+extended thinking (haiku-4.5) do NOT emit `stream_event` tokens. Instead,
+text arrives as complete blocks in `assistant` events — first a `thinking`
+block, then a `text` block. Always handle both `assistant` text blocks and
+`stream_event` deltas so your app works with any model.
+
+**Extracting text and tool use from `assistant` events:**
 
 ```typescript
 if (event.type === "assistant" && event.message?.content) {
   for (const block of event.message.content) {
-    if (block.type === "text") {
-      // Complete text block (not incremental — use stream_event for that)
+    if (block.type === "text" && block.text) {
+      // Complete text block — forward as token(s) to the frontend.
+      // With extended-thinking models, this IS the primary text delivery.
     } else if (block.type === "tool_use") {
       // Claude is calling a tool: block.name, block.input
       // Forward to frontend for progress indication
