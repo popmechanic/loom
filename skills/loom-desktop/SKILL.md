@@ -132,3 +132,75 @@ For the full setup guide — project structure, configuration, dev workflow — 
 `@references/electrobun-setup.md`.
 
 For Claude CLI flags and output formats, see `@references/cli-runtime-reference.md`.
+
+## The Conversation
+
+When someone comes to you with a desktop app idea, walk through these design
+questions. Don't dump them all at once — have a natural conversation. But cover
+this ground before you start building.
+
+### 1. What does this app do?
+
+Get concrete about the interface. What does someone see when they open it? What
+do they click? What appears when Claude is working? What does the output look
+like?
+
+Desktop apps have a stronger "tool" identity than web apps. A web app might be a
+dashboard someone visits. A desktop app is something someone installs and
+reaches for. What's the tool? What problem does it solve?
+
+Ask: "Walk me through opening this app. What do you see? What do you do first?"
+
+### 2. What Claude capabilities does it need?
+
+Map the app's features to what Claude does behind the scenes:
+
+| Need | Claude Configuration |
+|------|---------------------|
+| Read and analyze files | `--tools "Read,Glob,Grep"` |
+| Modify code or files | `--tools "Read,Edit,Write,Glob,Grep,Bash"` |
+| Pure reasoning, no file access | `--tools ""` |
+| Web research | `--tools "WebSearch,WebFetch"` |
+| Structured data extraction | `--json-schema '{...}'` |
+| Custom persona | `--system-prompt "You are..."` |
+
+The tools list determines what Claude can do. Tighter is safer — only grant what
+the app actually needs.
+
+### 3. What's the interaction model?
+
+How does the person's action translate to a Claude invocation?
+
+| Interaction | Pattern |
+|-------------|---------|
+| Click a button, get a result | **Synchronous** — spawn, collect, return |
+| Watch progress in real-time | **Streaming** — tokens flow as RPC messages |
+| Multi-step conversation with context | **Conversational** — `--session-id` + `--continue` |
+| Long task, minimize to tray | **Background** — task registry + tray status |
+
+Most desktop apps start with Streaming. Add Conversational if the user needs
+follow-up questions. Add Background for tasks that take minutes.
+
+### 4. What desktop features matter?
+
+This is where desktop Loom diverges from web Loom. Ask which native features
+the app needs:
+
+- **File drag-and-drop** — Drop files onto the window to feed them to Claude
+- **Native file dialogs** — "Open File..." to select input, save results to disk
+- **System tray** — Minimize during long tasks, show progress in tooltip
+- **Native menus** — App menu bar with New Task, Abort, Model Selection, Settings
+- **Notifications** — Native OS notification when a background task completes
+
+Not every app needs all of these. A simple analysis tool might only need
+drag-and-drop. A code assistant might need the full set.
+
+### 5. What are the cost and safety boundaries?
+
+Desktop simplifies auth (no OAuth needed) but cost and permissions still matter:
+
+- **Budget**: `--max-budget-usd` caps spending per task. What's appropriate? $0.50 for quick analysis, $5 for deep codebase review.
+- **Model**: Haiku for fast/cheap, Sonnet for balanced, Opus for best quality. `--fallback-model haiku` for reliability.
+- **Permissions**: Use `--permission-mode dontAsk` with explicit `--tools` list. This auto-denies anything not whitelisted.
+- **Turn limit**: `--max-turns` prevents runaway agent loops.
+- **Filesystem scope**: Consider constraining Claude to specific directories via `--allowedTools "Read(/path/**)"` patterns.
