@@ -740,6 +740,148 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 For long-running servers, consider a periodic sweep of your temp directory
 to catch orphaned files from crashed requests.
 
+### Advanced Patterns
+
+These patterns appear in production but aren't needed for every app. Reach
+for them when the basic patterns aren't enough.
+
+#### Structured Extraction (Async Haiku)
+
+For lightweight data extraction tasks — form field suggestions, entity
+parsing, classification — spawn a one-shot Haiku process with no tools
+and a JSON schema. Async with a timeout kill, unlike the synchronous
+`execFileSync` REST pattern.
+
+```typescript
+async function extract<T>(prompt: string, schema: object, timeoutMs = 30000): Promise<T> {
+  const proc = spawn("claude", [
+    "-p", "--model", "haiku", "--output-format", "json",
+    "--json-schema", JSON.stringify(schema),
+    "--tools", "", "--no-session-persistence",
+    "--permission-mode", "dontAsk", "--max-budget-usd", "0.25"
+  ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv() });
+
+  proc.stdin.write(prompt);
+  proc.stdin.end();
+
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+
+  try {
+    let stdout = "";
+    for await (const chunk of proc.stdout) stdout += chunk.toString();
+    const exitCode = await new Promise<number>(r => proc.on("close", r));
+    if (exitCode !== 0) {
+      let stderr = "";
+      for await (const chunk of proc.stderr) stderr += chunk.toString();
+      throw new Error(`Extraction failed (exit ${exitCode}): ${stderr.slice(0, 200)}`);
+    }
+    const wrapper = JSON.parse(stdout);
+    if (wrapper.structured_output) return wrapper.structured_output as T;
+    if (typeof wrapper.result === "string") return JSON.parse(wrapper.result) as T;
+    return wrapper as T;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+#### Persistent Session (Long-Lived Process)
+
+Instead of spawning a new process per request, keep one Claude process alive
+and send messages via JSONL on stdin. Lower latency, continuous context, no
+session serialization overhead. The tradeoff is lifecycle management.
+
+```typescript
+import { spawn, ChildProcess } from "child_process";
+
+let proc: ChildProcess | null = null;
+let sessionActive = false;
+let lastActivity = Date.now();
+
+function startSession(systemPrompt?: string) {
+  const args = [
+    "-p",
+    "--input-format", "stream-json",
+    "--output-format", "stream-json", "--verbose",
+    "--permission-mode", "dontAsk",
+    "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
+    "--max-budget-usd", "10",
+  ];
+  if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
+
+  proc = spawn("claude", args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: cleanEnv(),
+  });
+  sessionActive = true;
+
+  const parse = createStreamParser((event) => {
+    // Forward events to SSE/WebSocket clients
+    broadcast(event);
+  });
+  proc.stdout!.on("data", parse);
+  proc.stderr!.on("data", (chunk) => console.error(`[claude] ${chunk}`));
+  proc.on("close", () => { sessionActive = false; proc = null; });
+}
+
+function sendMessage(text: string): boolean {
+  if (!proc || !sessionActive) return false;
+  const jsonl = JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text }] },
+  }) + "\n";
+  proc.stdin!.write(jsonl);
+  lastActivity = Date.now();
+  return true;
+}
+
+function endSession() {
+  if (proc) proc.kill();
+}
+
+// Inactivity timeout — kill idle sessions after 15 minutes
+setInterval(() => {
+  if (sessionActive && Date.now() - lastActivity > 15 * 60 * 1000) {
+    endSession();
+  }
+}, 60000);
+```
+
+Key differences from the per-request patterns:
+- Uses `--input-format stream-json` for bidirectional communication
+- Stdin stays open — messages are newline-delimited JSON, not piped and closed
+- `--append-system-prompt` injects persona/constraints without replacing base prompt
+- Must manage lifecycle: start, stop, inactivity timeout
+
+#### Action Markers
+
+Let Claude trigger structured side-effects from within its text output. Define
+a marker format in your system prompt, parse it server-side, and forward as
+typed events to the frontend.
+
+```typescript
+// In your system prompt:
+// "When you complete a task, emit: [ACTION] {\"type\":\"task_complete\",\"data\":{...}}"
+
+function parseMarkers(event: any, emit: (marker: any) => void) {
+  if (event.type !== "assistant" || !event.message?.content) return;
+  for (const block of event.message.content) {
+    if (block.type !== "text") continue;
+    for (const line of block.text.split("\n")) {
+      const match = line.match(/\[ACTION\]\s*(\{.*\})/);
+      if (match) {
+        try { emit(JSON.parse(match[1])); } catch { /* malformed marker */ }
+      }
+    }
+  }
+}
+```
+
+This is more flexible than `--json-schema` alone because Claude can emit
+markers at any point during its response — not just at the end. Use it when
+you need Claude to trigger UI updates (progress steps, agent registration,
+sound effects) as part of a longer operation.
+
 ## What to Generate
 
 When you build the app, produce:
