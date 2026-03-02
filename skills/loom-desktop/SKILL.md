@@ -204,3 +204,167 @@ Desktop simplifies auth (no OAuth needed) but cost and permissions still matter:
 - **Permissions**: Use `--permission-mode dontAsk` with explicit `--tools` list. This auto-denies anything not whitelisted.
 - **Turn limit**: `--max-turns` prevents runaway agent loops.
 - **Filesystem scope**: Consider constraining Claude to specific directories via `--allowedTools "Read(/path/**)"` patterns.
+
+## Building It
+
+Default to **TypeScript** for both the Bun process and the webview. Use
+**React** for the UI unless the person prefers vanilla HTML.
+
+### Shared Utilities
+
+Every pattern below uses these helpers. Define them once in a shared module
+(e.g., `src/bun/claude-manager.ts`).
+
+**`cleanEnv()`** — Remove nesting guards so `claude -p` can start.
+
+When you develop inside Claude Code (which is common), two environment
+variables — `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` — tell Claude it's
+already running and block nested processes. Remove exactly these two. Do NOT
+filter all `CLAUDE*` vars — that kills auth tokens
+(`CLAUDE_CODE_OAUTH_TOKEN`) and feature flags.
+
+If running inside **cmux** (the Claude terminal app), `CMUX_*` surface
+identifiers trigger nesting detection. These are terminal-state vars, not
+auth — safe to remove.
+
+```typescript
+function cleanEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  // cmux terminal sets CMUX_* vars that trigger nesting detection.
+  // These are terminal-state identifiers, not auth tokens — safe to remove.
+  if (env.CMUX_SURFACE_ID) {
+    delete env.CMUX_SURFACE_ID;
+    delete env.CMUX_PANEL_ID;
+    delete env.CMUX_TAB_ID;
+    delete env.CMUX_WORKSPACE_ID;
+    delete env.CMUX_SOCKET_PATH;
+  }
+  return env;
+}
+```
+
+**`createStreamParser()`** — Buffer stdout chunks into complete JSON lines.
+
+TCP delivers data in arbitrary chunks. A JSON line can split across two read
+events. Without buffering, the first half fails `JSON.parse` and gets silently
+discarded.
+
+```typescript
+function createStreamParser(onEvent: (event: any) => void) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  return (chunk: Buffer | Uint8Array) => {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        onEvent(JSON.parse(line));
+      } catch (err) {
+        console.warn("[claude stdout] JSON parse error:", (err as Error).message, line.slice(0, 200));
+      }
+    }
+  };
+}
+```
+
+Use `TextDecoder` with `{ stream: true }` — not `chunk.toString()` — to handle
+multi-byte UTF-8 characters that split across chunk boundaries.
+
+### Event Type Mapping
+
+`claude -p --output-format stream-json --verbose` emits newline-delimited JSON.
+Each event maps to an RPC message:
+
+| Stream Event | RPC Message | Notes |
+|---|---|---|
+| `system` (subtype: init) | `status` (state: "running") | Session started |
+| `assistant` (text content block) | `token` | Complete text for thinking models |
+| `stream_event` (content_block_delta) | `token` | Incremental for non-thinking models |
+| `assistant` (tool_use content block) | `toolUse` | Tool invocation |
+| `tool_result` | `toolResult` | Tool output |
+| `result` (subtype: success) | `done` | Session complete with cost |
+| parse error / process crash | `error` | Process failure |
+
+### `deriveAndSendRPC()`
+
+This function reads a parsed stream event and fires the appropriate RPC message.
+It also tracks state for the heartbeat system.
+
+```typescript
+// State for heartbeat
+let currentState: "spawning" | "running" | "thinking" | "tool_use" | "idle" = "spawning";
+let lastToolName = "";
+let lastOutputTime = Date.now();
+
+function deriveAndSendRPC(
+  taskId: string,
+  event: any,
+  rpc: { send: LoomRPC["webview"]["messages"] }
+) {
+  lastOutputTime = Date.now();
+
+  switch (event.type) {
+    case "system":
+      currentState = "running";
+      break;
+
+    case "assistant": {
+      const msg = event.message;
+      if (!msg?.content) break;
+      for (const block of msg.content) {
+        if (block.type === "text") {
+          rpc.send.token({ taskId, text: block.text });
+          currentState = "running";
+        } else if (block.type === "tool_use") {
+          rpc.send.toolUse({ taskId, tool: block.name, input: block.input });
+          currentState = "tool_use";
+          lastToolName = block.name;
+        }
+      }
+      break;
+    }
+
+    case "stream_event": {
+      const delta = event.event?.delta;
+      if (delta?.text) {
+        rpc.send.token({ taskId, text: delta.text });
+        currentState = "running";
+      }
+      if (delta?.type === "input_json_delta") {
+        // Tool input streaming — ignore, wait for full assistant message
+      }
+      break;
+    }
+
+    case "tool_result": {
+      const content = event.content ?? event.message?.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.map((b: any) => b.text ?? "").join("")
+          : JSON.stringify(content);
+      rpc.send.toolResult({
+        taskId,
+        tool: lastToolName,
+        output: text.slice(0, 10000),
+        isError: !!event.is_error,
+      });
+      currentState = "running";
+      break;
+    }
+
+    case "result":
+      rpc.send.done({
+        taskId,
+        cost: event.total_cost_usd ?? 0,
+        duration: event.duration_ms ?? 0,
+      });
+      currentState = "idle";
+      break;
+  }
+}
