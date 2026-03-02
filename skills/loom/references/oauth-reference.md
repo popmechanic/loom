@@ -197,3 +197,113 @@ app.post("/api/oauth/exchange", async (req, res) => {
   }
 });
 ```
+
+---
+
+## Token Lifecycle
+
+### `writeCredentials()`
+
+Persists OAuth tokens in the format the Claude CLI expects. Sets file
+permissions to `0o600` (user read/write only).
+
+```typescript
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+const CLAUDE_CREDS_PATH = join(homedir(), ".claude", ".credentials.json");
+
+function writeCredentials(accessToken: string, refreshToken: string, expiresIn: number) {
+  const dir = join(homedir(), ".claude");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const creds = {
+    claudeAiOauth: {
+      accessToken,
+      refreshToken,
+      expiresAt: Date.now() + expiresIn * 1000,
+      scopes: ["user:inference", "user:mcp_servers", "user:profile", "user:sessions:claude_code"],
+    },
+  };
+  writeFileSync(CLAUDE_CREDS_PATH, JSON.stringify(creds, null, 2) + "\n", { mode: 0o600 });
+}
+```
+
+### `loadCredentials()`
+
+Checks whether valid credentials exist. Call on server startup to determine
+whether to show the setup screen or the main app.
+
+```typescript
+function loadCredentials(): { accessToken: string; expiresAt: number } | null {
+  if (!existsSync(CLAUDE_CREDS_PATH)) return null;
+  try {
+    const data = JSON.parse(readFileSync(CLAUDE_CREDS_PATH, "utf-8"));
+    const token = data?.claudeAiOauth?.accessToken;
+    const expiresAt = data?.claudeAiOauth?.expiresAt ?? 0;
+    if (typeof token === "string" && token.length > 0) return { accessToken: token, expiresAt };
+    return null;
+  } catch { return null; }
+}
+```
+
+### `refreshTokenIfNeeded()`
+
+Proactively refreshes the access token if it expires within 30 minutes.
+Call before spawning Claude subprocesses to prevent mid-session auth failures.
+
+**Important:** The refresh token rotates on every refresh — always persist
+the new refresh token from the response.
+
+```typescript
+async function refreshTokenIfNeeded(): Promise<boolean> {
+  const creds = loadCredentials();
+  if (!creds?.accessToken) return false;
+
+  let data: any;
+  try { data = JSON.parse(readFileSync(CLAUDE_CREDS_PATH, "utf-8")); } catch { return false; }
+
+  const refreshToken = data?.claudeAiOauth?.refreshToken;
+  if (!refreshToken) return false;
+
+  const thirtyMinutes = 30 * 60 * 1000;
+  if (creds.expiresAt > Date.now() + thirtyMinutes) return false;
+
+  try {
+    const resp = await fetch(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: OAUTH_CLIENT_ID,
+        scope: OAUTH_SCOPES,
+      }),
+    });
+    if (!resp.ok) return false;
+
+    const tokens = await resp.json();
+    writeCredentials(tokens.access_token, tokens.refresh_token, tokens.expires_in);
+    return true;
+  } catch { return false; }
+}
+```
+
+---
+
+## Integration Notes
+
+These functions fit into the server lifecycle at specific points:
+
+- **`loadCredentials()`** on server startup — determines whether to show the
+  setup screen or the main app
+- **`refreshTokenIfNeeded()`** before every `spawn("claude", ...)` call —
+  prevents mid-session auth failures
+- **`/api/health` endpoint** — returns `{ needsSetup: !loadCredentials() }`
+  for the frontend to poll after OAuth exchange
+
+```typescript
+app.get("/api/health", (req, res) => {
+  res.json({ needsSetup: !loadCredentials() });
+});
+```
