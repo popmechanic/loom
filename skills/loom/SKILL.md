@@ -511,17 +511,13 @@ app.post("/api/batch", async (req, res) => {
   const { items, task } = req.body;
   const TIMEOUT_MS = 30000;
 
-  const cleanEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.startsWith("CLAUDE"))
-  );
-
   const outcomes = await Promise.allSettled(
     items.map((item: string) => new Promise<any>((resolve, reject) => {
       const proc = spawn("claude", [
         "-p", "--model", "haiku", "--output-format", "json",
         "--permission-mode", "dontAsk", "--max-budget-usd", "0.50",
         "--json-schema", schema, "--tools", "", "--no-session-persistence"
-      ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv });
+      ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv() });
 
       const timeout = setTimeout(() => { proc.kill(); reject(new Error("Timeout")); }, TIMEOUT_MS);
       let stdout = "";
