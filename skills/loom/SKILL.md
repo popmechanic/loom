@@ -56,13 +56,17 @@ Every Loom app has the same basic shape:
 **Interface**: The custom UI. Whatever makes sense for what's being built.
 
 **Node Server**: The bridge. Receives requests from the interface, spawns Claude
-processes, parses output, streams results back. This is where you handle auth,
-rate limiting, session management, and the mapping between web concepts and
-Claude invocations.
+processes, parses output, streams results back. This is where you handle
+Anthropic OAuth authentication, rate limiting, session management, and the
+mapping between web concepts and Claude invocations. The server verifies
+credentials exist before spawning Claude and shows a setup screen if they're
+missing (see `references/oauth-reference.md`).
 
 **Claude Runtime**: The intelligence. `claude -p` with the right flags, or the
 Agent SDK for programmatic control. This is where the agentic work happens —
-reading files, running commands, generating structured output.
+reading files, running commands, generating structured output. Before the
+runtime can start, the user needs valid Anthropic credentials. See the OAuth
+setup in the Building It section below.
 
 ### Communication Patterns
 
