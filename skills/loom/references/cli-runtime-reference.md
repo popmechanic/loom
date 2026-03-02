@@ -440,3 +440,6 @@ claude -p --model opus "complex task"          # Best quality
 3. MCP tools load by default — use `--strict-mcp-config` to control
 4. `structured_output` is separate from `result` in JSON output
 5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start)
+6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
+7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`.
+8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
