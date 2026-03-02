@@ -194,6 +194,59 @@ Every pattern also handles three failure modes:
   Always wrap JSON.parse in try/catch and check `parsed.is_error` before
   using `structured_output`.
 
+#### Shared Utilities
+
+Every pattern below uses these two helpers. Define them once at the top of
+your server file.
+
+**`cleanEnv()`** — Remove nesting guards so `claude -p` can start.
+
+When your server runs inside Claude Code (which it often does during
+development), two environment variables — `CLAUDECODE` and
+`CLAUDE_CODE_ENTRYPOINT` — tell Claude it's already running and block nested
+processes. Remove exactly these two. Do NOT filter all `CLAUDE*` vars — that
+kills auth tokens (`CLAUDE_CODE_OAUTH_TOKEN`) and feature flags.
+
+```typescript
+function cleanEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  return env;
+}
+```
+
+**`createStreamParser()`** — Buffer stdout chunks into complete JSON lines.
+
+TCP delivers data in arbitrary chunks. A JSON line can split across two
+`data` events. Without buffering, the first half fails `JSON.parse` and
+gets silently discarded. Both Julian and vibes-skill use this identical
+buffer-and-split pattern.
+
+```typescript
+function createStreamParser(onEvent: (event: any) => void) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  return (chunk: Buffer | Uint8Array) => {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        onEvent(JSON.parse(line));
+      } catch (err) {
+        console.warn("[claude stdout] JSON parse error:", (err as Error).message, line.slice(0, 200));
+      }
+    }
+  };
+}
+```
+
+Use `TextDecoder` with `{ stream: true }` — not `chunk.toString()` — to
+handle multi-byte UTF-8 characters that split across chunk boundaries.
+
 #### Pattern: REST Endpoint (One-Shot)
 
 Someone triggers an action → server calls Claude → returns JSON.
