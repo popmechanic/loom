@@ -70,7 +70,7 @@ Every Loom desktop app has this shape:
 │  │  Shows tokens │  rpc.request    │               │  │
 │  │  Tool status  │──abort()──────►│  Spawns       │  │
 │  │               │                 │  claude -p    │  │
-│  │               │◄─rpc.send      │               │  │
+│  │               │◄─rpc.sendProxy │               │  │
 │  │               │  .token()       │  Parses       │  │
 │  │               │  .toolUse()     │  stdout       │  │
 │  │               │  .done()        │  stream       │  │
@@ -159,13 +159,18 @@ Map the app's features to what Claude does behind the scenes:
 |------|---------------------|
 | Read and analyze files | `--tools "Read,Glob,Grep"` |
 | Modify code or files | `--tools "Read,Edit,Write,Glob,Grep,Bash"` |
-| Pure reasoning, no file access | `--tools ""` |
+| Pure reasoning, no file access | Omit `--tools` and use `--permission-mode bypassPermissions` |
 | Web research | `--tools "WebSearch,WebFetch"` |
 | Structured data extraction | `--json-schema '{...}'` |
 | Custom persona | `--system-prompt "You are..."` |
 
 The tools list determines what Claude can do. Tighter is safer — only grant what
 the app actually needs.
+
+**Note:** `--tools ""` (empty string) is fragile and causes ambiguous CLI
+behavior. For pure reasoning tasks, prefer omitting `--tools` entirely and
+relying on `bypassPermissions` with no tool invocations, or pass file content
+directly in the prompt so Claude doesn't need tools.
 
 ### 3. What's the interaction model?
 
@@ -201,7 +206,7 @@ Desktop simplifies auth (no OAuth needed) but cost and permissions still matter:
 
 - **Budget**: `--max-budget-usd` caps spending per task. What's appropriate? $0.50 for quick analysis, $5 for deep codebase review.
 - **Model**: Haiku for fast/cheap, Sonnet for balanced, Opus for best quality. `--fallback-model haiku` for reliability.
-- **Permissions**: Use `--permission-mode dontAsk` with explicit `--tools` list. This auto-denies anything not whitelisted.
+- **Permissions**: Use `--permission-mode bypassPermissions` with explicit `--tools` list. `dontAsk` auto-denies anything not whitelisted, but also blocks reads outside the project directory — meaning dropped files from ~/Desktop won't be accessible. `bypassPermissions` is safer for desktop apps where you control the prompt.
 - **Turn limit**: `--max-turns` prevents runaway agent loops.
 - **Filesystem scope**: Consider constraining Claude to specific directories via `--allowedTools "Read(/path/**)"` patterns.
 
@@ -304,7 +309,7 @@ let lastOutputTime = Date.now();
 function deriveAndSendRPC(
   taskId: string,
   event: any,
-  rpc: { send: LoomRPC["webview"]["messages"] }
+  rpc: { sendProxy: LoomRPC["webview"]["messages"] }
 ) {
   lastOutputTime = Date.now();
 
@@ -318,10 +323,10 @@ function deriveAndSendRPC(
       if (!msg?.content) break;
       for (const block of msg.content) {
         if (block.type === "text") {
-          rpc.send.token({ taskId, text: block.text });
+          rpc.sendProxy.token({ taskId, text: block.text });
           currentState = "running";
         } else if (block.type === "tool_use") {
-          rpc.send.toolUse({ taskId, tool: block.name, input: block.input });
+          rpc.sendProxy.toolUse({ taskId, tool: block.name, input: block.input });
           currentState = "tool_use";
           lastToolName = block.name;
         }
@@ -332,7 +337,7 @@ function deriveAndSendRPC(
     case "stream_event": {
       const delta = event.event?.delta;
       if (delta?.text) {
-        rpc.send.token({ taskId, text: delta.text });
+        rpc.sendProxy.token({ taskId, text: delta.text });
         currentState = "running";
       }
       if (delta?.type === "input_json_delta") {
@@ -348,7 +353,7 @@ function deriveAndSendRPC(
         : Array.isArray(content)
           ? content.map((b: any) => b.text ?? "").join("")
           : JSON.stringify(content);
-      rpc.send.toolResult({
+      rpc.sendProxy.toolResult({
         taskId,
         tool: lastToolName,
         output: text.slice(0, 10000),
@@ -359,7 +364,7 @@ function deriveAndSendRPC(
     }
 
     case "result":
-      rpc.send.done({
+      rpc.sendProxy.done({
         taskId,
         cost: event.total_cost_usd ?? 0,
         duration: event.duration_ms ?? 0,
@@ -388,55 +393,57 @@ import { BrowserView } from "electrobun/bun";
 
 const rpc = BrowserView.defineRPC<LoomRPC>({
   handlers: {
-    startTask: async ({ prompt, model, tools, maxBudget }) => {
-      const taskId = crypto.randomUUID();
+    requests: {
+      startTask: async ({ prompt, model, tools, maxBudget }) => {
+        const taskId = crypto.randomUUID();
 
-      const schema = JSON.stringify({
-        type: "object",
-        properties: {
-          result: { type: "string" },
-          items: { type: "array", items: { type: "object" } },
-        },
-        required: ["result"],
-      });
+        const schema = JSON.stringify({
+          type: "object",
+          properties: {
+            result: { type: "string" },
+            items: { type: "array", items: { type: "object" } },
+          },
+          required: ["result"],
+        });
 
-      try {
-        const proc = Bun.spawnSync([
-          "claude", "-p",
-          "--output-format", "json",
-          "--permission-mode", "dontAsk",
-          "--tools", (tools || []).join(","),
-          "--model", model || "sonnet",
-          "--max-budget-usd", String(maxBudget || 1),
-          "--json-schema", schema,
-          "--no-session-persistence",
-          prompt,
-        ], { env: cleanEnv(), timeout: 60000 });
+        try {
+          const proc = Bun.spawnSync([
+            "claude", "-p",
+            "--output-format", "json",
+            "--permission-mode", "bypassPermissions",
+            "--setting-sources", "",
+            "--model", model || "sonnet",
+            "--max-budget-usd", String(maxBudget || 1),
+            "--json-schema", schema,
+            "--no-session-persistence",
+            prompt,
+          ], { env: cleanEnv(), timeout: 60000 });
 
-        if (proc.exitCode !== 0) {
-          const stderr = proc.stderr.toString().trim();
-          rpc.send.error({ taskId, message: stderr || `Exit code ${proc.exitCode}` });
-          return { taskId };
+          if (proc.exitCode !== 0) {
+            const stderr = proc.stderr.toString().trim();
+            rpc.sendProxy.error({ taskId, message: stderr || `Exit code ${proc.exitCode}` });
+            return { taskId };
+          }
+
+          const parsed = JSON.parse(proc.stdout.toString());
+          if (parsed.is_error) {
+            rpc.sendProxy.error({ taskId, message: parsed.result });
+          } else {
+            rpc.sendProxy.token({ taskId, text: parsed.result });
+            rpc.sendProxy.done({
+              taskId,
+              cost: parsed.total_cost_usd ?? 0,
+              duration: parsed.duration_ms ?? 0,
+            });
+          }
+        } catch (err: any) {
+          rpc.sendProxy.error({ taskId, message: err.message });
         }
 
-        const parsed = JSON.parse(proc.stdout.toString());
-        if (parsed.is_error) {
-          rpc.send.error({ taskId, message: parsed.result });
-        } else {
-          rpc.send.token({ taskId, text: parsed.result });
-          rpc.send.done({
-            taskId,
-            cost: parsed.total_cost_usd ?? 0,
-            duration: parsed.duration_ms ?? 0,
-          });
-        }
-      } catch (err: any) {
-        rpc.send.error({ taskId, message: err.message });
-      }
-
-      return { taskId };
+        return { taskId };
+      },
+      abort: async () => ({ success: false }), // Can't abort sync
     },
-    abort: async () => ({ success: false }), // Can't abort sync
   },
 });
 ```
@@ -491,12 +498,16 @@ function spawnClaude(
   const args = [
     "-p",
     "--output-format", "stream-json", "--verbose",
-    "--permission-mode", "dontAsk",
-    "--tools", (opts.tools || []).join(","),
+    "--permission-mode", "bypassPermissions",
+    "--setting-sources", "",
     "--model", opts.model || "sonnet",
     "--max-budget-usd", String(opts.maxBudget || 1),
     "--no-session-persistence",
   ];
+  // Add tools if specified (omitting --tools entirely = all tools available)
+  if (opts.tools && opts.tools.length > 0) {
+    args.push("--tools", opts.tools.join(","));
+  }
   if (opts.sessionId) {
     args.push("--session-id", opts.sessionId, "--continue");
   }
@@ -511,7 +522,7 @@ function spawnClaude(
 
   // Status heartbeat — every 2 seconds while the task runs
   const heartbeat = setInterval(() => {
-    rpc.send.status({
+    rpc.sendProxy.status({
       taskId,
       state: currentState,
       detail: currentState === "tool_use" ? lastToolName : undefined,
@@ -522,6 +533,22 @@ function spawnClaude(
 
   // Track for abort
   activeTasks.set(taskId, { proc, heartbeat });
+
+  // Collect stderr proactively — ReadableStream can only be consumed once.
+  // If you read proc.stderr in an error handler after already consuming it
+  // elsewhere, you'll get "ReadableStream already used".
+  const stderrChunks: string[] = [];
+  const stderrDecoder = new TextDecoder();
+  (async () => {
+    const reader = proc.stderr.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        stderrChunks.push(stderrDecoder.decode(value, { stream: true }));
+      }
+    } catch {}
+  })();
 
   // Parse stdout stream
   const parse = createStreamParser((event) => {
@@ -537,10 +564,10 @@ function spawnClaude(
         if (!msg?.content) break;
         for (const block of msg.content) {
           if (block.type === "text") {
-            rpc.send.token({ taskId, text: block.text });
+            rpc.sendProxy.token({ taskId, text: block.text });
             currentState = "running";
           } else if (block.type === "tool_use") {
-            rpc.send.toolUse({ taskId, tool: block.name, input: block.input });
+            rpc.sendProxy.toolUse({ taskId, tool: block.name, input: block.input });
             currentState = "tool_use";
             lastToolName = block.name;
           }
@@ -551,7 +578,7 @@ function spawnClaude(
       case "stream_event": {
         const delta = event.event?.delta;
         if (delta?.text) {
-          rpc.send.token({ taskId, text: delta.text });
+          rpc.sendProxy.token({ taskId, text: delta.text });
           currentState = "running";
         }
         break;
@@ -564,7 +591,7 @@ function spawnClaude(
           : Array.isArray(content)
             ? content.map((b: any) => b.text ?? "").join("")
             : JSON.stringify(content);
-        rpc.send.toolResult({
+        rpc.sendProxy.toolResult({
           taskId,
           tool: lastToolName,
           output: text.slice(0, 10000),
@@ -575,7 +602,7 @@ function spawnClaude(
       }
 
       case "result":
-        rpc.send.done({
+        rpc.sendProxy.done({
           taskId,
           cost: event.total_cost_usd ?? 0,
           duration: event.duration_ms ?? 0,
@@ -607,8 +634,8 @@ function spawnClaude(
     // Process finished — check for errors
     const exitCode = await proc.exited;
     if (exitCode !== 0 && currentState !== "idle") {
-      const stderr = await new Response(proc.stderr).text();
-      rpc.send.error({
+      const stderr = stderrChunks.join("");
+      rpc.sendProxy.error({
         taskId,
         message: stderr.trim() || `Claude exited with code ${exitCode}`,
       });
@@ -627,20 +654,22 @@ Wire the RPC to `spawnClaude`:
 ```typescript
 const rpc = BrowserView.defineRPC<LoomRPC>({
   handlers: {
-    startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
-      const taskId = crypto.randomUUID();
-      spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId }, rpc);
-      return { taskId };
-    },
-    abort: async ({ taskId }) => {
-      const task = activeTasks.get(taskId);
-      if (!task) return { success: false };
+    requests: {
+      startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
+        const taskId = crypto.randomUUID();
+        spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId }, rpc);
+        return { taskId };
+      },
+      abort: async ({ taskId }) => {
+        const task = activeTasks.get(taskId);
+        if (!task) return { success: false };
 
-      task.proc.kill("SIGTERM");
-      clearInterval(task.heartbeat);
-      activeTasks.delete(taskId);
-      rpc.send.error({ taskId, message: "Task aborted by user" });
-      return { success: true };
+        task.proc.kill("SIGTERM");
+        clearInterval(task.heartbeat);
+        activeTasks.delete(taskId);
+        rpc.sendProxy.error({ taskId, message: "Task aborted by user" });
+        return { success: true };
+      },
     },
   },
 });
@@ -648,14 +677,41 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
 
 **Webview-side: Receiving messages**
 
-The frontend registers handlers for each message type. Here's a minimal React
-component that renders streaming tokens with status:
+The frontend defines message handlers via `Electroview.defineRPC()` — there
+is no `electrobun.rpc.on.*` event API. Message handlers are declared upfront
+and connected to React state via module-level callback refs:
 
 ```tsx
 import { useState, useEffect, useRef } from "react";
 import { Electroview } from "electrobun/view";
 
-const electrobun = new Electroview<LoomRPC>();
+// Module-level callback refs — set by the React component on mount.
+// defineRPC handlers fire these to bridge into React state.
+const callbacks = {
+  onToken: null as ((data: { taskId: string; text: string }) => void) | null,
+  onToolUse: null as ((data: { taskId: string; tool: string; input: any }) => void) | null,
+  onToolResult: null as ((data: { taskId: string; tool: string; output: string; isError: boolean }) => void) | null,
+  onStatus: null as ((data: { taskId: string; state: string; detail?: string; elapsedMs: number }) => void) | null,
+  onDone: null as ((data: { taskId: string; cost: number; duration: number }) => void) | null,
+  onError: null as ((data: { taskId: string; message: string }) => void) | null,
+};
+
+// Define RPC with message handlers — this is how the webview receives
+// messages from the Bun process. NOT electrobun.rpc.on.* (that doesn't exist).
+const rpc = Electroview.defineRPC<LoomRPC>({
+  handlers: {
+    messages: {
+      token: (data) => callbacks.onToken?.(data),
+      toolUse: (data) => callbacks.onToolUse?.(data),
+      toolResult: (data) => callbacks.onToolResult?.(data),
+      status: (data) => callbacks.onStatus?.(data),
+      done: (data) => callbacks.onDone?.(data),
+      error: (data) => callbacks.onError?.(data),
+    },
+  },
+});
+
+const electrobun = new Electroview({ rpc });
 
 function App() {
   const [output, setOutput] = useState("");
@@ -666,37 +722,33 @@ function App() {
   const outputRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
-    electrobun.rpc.on.token(({ taskId: tid, text }) => {
-      setOutput((prev) => prev + text);
-    });
-
-    electrobun.rpc.on.toolUse(({ tool }) => {
-      setTools((prev) => [...prev, tool]);
-    });
-
-    electrobun.rpc.on.toolResult(({ tool, isError }) => {
-      setTools((prev) => prev.filter((t) => t !== tool));
-    });
-
-    electrobun.rpc.on.status(({ state, detail, elapsedMs }) => {
+    callbacks.onToken = ({ text }) => setOutput((prev) => prev + text);
+    callbacks.onToolUse = ({ tool }) => setTools((prev) => [...prev, tool]);
+    callbacks.onToolResult = ({ tool }) => setTools((prev) => prev.filter((t) => t !== tool));
+    callbacks.onStatus = ({ state, detail, elapsedMs }) => {
       const secs = Math.round(elapsedMs / 1000);
       setStatus(detail ? `${state}: ${detail} (${secs}s)` : `${state} (${secs}s)`);
-    });
-
-    electrobun.rpc.on.done(({ cost: c, duration }) => {
+    };
+    callbacks.onDone = ({ cost: c, duration }) => {
       setCost(c);
       setStatus(`Done in ${Math.round(duration / 1000)}s`);
       setTaskId(null);
-    });
-
-    electrobun.rpc.on.error(({ message }) => {
+    };
+    callbacks.onError = ({ message }) => {
       setStatus(`Error: ${message}`);
       setTaskId(null);
-    });
+    };
+    return () => {
+      callbacks.onToken = null;
+      callbacks.onToolUse = null;
+      callbacks.onToolResult = null;
+      callbacks.onStatus = null;
+      callbacks.onDone = null;
+      callbacks.onError = null;
+    };
   }, []);
 
   useEffect(() => {
-    // Auto-scroll output
     if (outputRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
@@ -816,43 +868,45 @@ Replace the `startTask` handler with session awareness:
 ```typescript
 const rpc = BrowserView.defineRPC<LoomRPC>({
   handlers: {
-    startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
-      const taskId = crypto.randomUUID();
+    requests: {
+      startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
+        const taskId = crypto.randomUUID();
 
-      let actualSessionId: string;
-      if (sessionId && sessions.has(sessionId)) {
-        // Follow-up turn — reuse session
-        actualSessionId = sessionId;
-        const session = sessions.get(sessionId)!;
-        session.turns++;
-        session.lastActivity = Date.now();
-      } else {
-        // First turn — create new session
-        actualSessionId = crypto.randomUUID();
-        sessions.set(actualSessionId, {
+        let actualSessionId: string;
+        if (sessionId && sessions.has(sessionId)) {
+          // Follow-up turn — reuse session
+          actualSessionId = sessionId;
+          const session = sessions.get(sessionId)!;
+          session.turns++;
+          session.lastActivity = Date.now();
+        } else {
+          // First turn — create new session
+          actualSessionId = crypto.randomUUID();
+          sessions.set(actualSessionId, {
+            sessionId: actualSessionId,
+            turns: 1,
+            lastActivity: Date.now(),
+          });
+        }
+
+        // spawnClaude already handles --session-id and --continue
+        // when opts.sessionId is provided
+        spawnClaude(taskId, prompt, {
+          model, tools, maxBudget,
           sessionId: actualSessionId,
-          turns: 1,
-          lastActivity: Date.now(),
-        });
-      }
+        }, rpc);
 
-      // spawnClaude already handles --session-id and --continue
-      // when opts.sessionId is provided
-      spawnClaude(taskId, prompt, {
-        model, tools, maxBudget,
-        sessionId: actualSessionId,
-      }, rpc);
-
-      return { taskId };
-    },
-    abort: async ({ taskId }) => {
-      const task = activeTasks.get(taskId);
-      if (!task) return { success: false };
-      task.proc.kill("SIGTERM");
-      clearInterval(task.heartbeat);
-      activeTasks.delete(taskId);
-      rpc.send.error({ taskId, message: "Task aborted by user" });
-      return { success: true };
+        return { taskId };
+      },
+      abort: async ({ taskId }) => {
+        const task = activeTasks.get(taskId);
+        if (!task) return { success: false };
+        task.proc.kill("SIGTERM");
+        clearInterval(task.heartbeat);
+        activeTasks.delete(taskId);
+        rpc.sendProxy.error({ taskId, message: "Task aborted by user" });
+        return { success: true };
+      },
     },
   },
 });
@@ -871,13 +925,33 @@ A minimal chat component that maintains conversation context:
 import { useState, useEffect, useRef } from "react";
 import { Electroview } from "electrobun/view";
 
-const electrobun = new Electroview<LoomRPC>();
-
 type Message = {
   role: "user" | "assistant";
   content: string;
   taskId?: string;
 };
+
+// Module-level callback refs for message handlers
+const chatCallbacks = {
+  onToken: null as ((data: { taskId: string; text: string }) => void) | null,
+  onDone: null as (() => void) | null,
+  onError: null as ((data: { message: string }) => void) | null,
+};
+
+const rpc = Electroview.defineRPC<LoomRPC>({
+  handlers: {
+    messages: {
+      token: (data) => chatCallbacks.onToken?.(data),
+      toolUse: () => {},
+      toolResult: () => {},
+      status: () => {},
+      done: () => chatCallbacks.onDone?.(),
+      error: (data) => chatCallbacks.onError?.(data),
+    },
+  },
+});
+
+const electrobun = new Electroview({ rpc });
 
 function ChatApp() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -887,7 +961,7 @@ function ChatApp() {
   const messagesEnd = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    electrobun.rpc.on.token(({ taskId, text }) => {
+    chatCallbacks.onToken = ({ taskId, text }) => {
       setMessages((prev) => {
         const last = prev[prev.length - 1];
         if (last?.taskId === taskId && last.role === "assistant") {
@@ -895,13 +969,17 @@ function ChatApp() {
         }
         return [...prev, { role: "assistant", content: text, taskId }];
       });
-    });
-
-    electrobun.rpc.on.done(() => setStreaming(false));
-    electrobun.rpc.on.error(({ message }) => {
+    };
+    chatCallbacks.onDone = () => setStreaming(false);
+    chatCallbacks.onError = ({ message }) => {
       setStreaming(false);
       setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${message}` }]);
-    });
+    };
+    return () => {
+      chatCallbacks.onToken = null;
+      chatCallbacks.onDone = null;
+      chatCallbacks.onError = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -1140,25 +1218,47 @@ pick what the app needs.
 
 ### File Drag-and-Drop
 
-Users drop files onto the window. ElectroBun provides the file paths. The Bun
-process feeds them to Claude as context.
+Users drop files onto the window for Claude to analyze. **Important:**
+`File.path` is an Electron-specific extension — it does NOT exist in WKWebView
+(macOS), WebView2 (Windows), or WebKit2GTK (Linux). You must use
+`FileReader.readAsText()` in the webview and send file content over RPC.
 
-**Webview-side: Drop handler**
+This changes the architecture: the Bun process receives file content directly,
+not filesystem paths. This also avoids `dontAsk` permission issues — Claude
+doesn't need to `Read` files that were already loaded into memory.
+
+**Webview-side: Drop handler (reads content via FileReader)**
 
 ```tsx
-function DropZone({ onFilesDropped }: { onFilesDropped: (paths: string[]) => void }) {
+type DroppedFile = { name: string; content: string };
+
+function DropZone({ onFilesRead }: { onFilesRead: (files: DroppedFile[]) => void }) {
   const [dragging, setDragging] = useState(false);
+
+  async function readFiles(fileList: FileList) {
+    const files: DroppedFile[] = [];
+    for (const file of Array.from(fileList)) {
+      const content = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file);
+      });
+      files.push({ name: file.name, content });
+    }
+    return files;
+  }
 
   return (
     <div
       className={`drop-zone ${dragging ? "active" : ""}`}
       onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
-      onDrop={(e) => {
+      onDrop={async (e) => {
         e.preventDefault();
         setDragging(false);
-        const paths = Array.from(e.dataTransfer.files).map((f) => f.path);
-        if (paths.length > 0) onFilesDropped(paths);
+        const files = await readFiles(e.dataTransfer.files);
+        if (files.length > 0) onFilesRead(files);
       }}
     >
       Drop files here to analyze
@@ -1167,21 +1267,22 @@ function DropZone({ onFilesDropped }: { onFilesDropped: (paths: string[]) => voi
 }
 ```
 
-**Bun-side: Incorporating dropped files into prompts**
+**Bun-side: Incorporating file content into prompts**
 
-When the webview sends file paths via `startTask`, build a prompt that
-references them:
+The webview sends file content (not paths) via RPC. Include it directly
+in the prompt — Claude doesn't need filesystem tools to read it:
 
 ```typescript
-// In the startTask handler:
-const fileContext = paths.length > 0
-  ? `\n\nAnalyze these files:\n${paths.map((p) => `- ${p}`).join("\n")}`
+// In the startTask handler — files are { name, content } objects:
+const fileContext = files.length > 0
+  ? files.map((f) => `\n\n--- ${f.name} ---\n${f.content}`).join("")
   : "";
 const fullPrompt = prompt + fileContext;
 ```
 
-Or for read-only analysis, use `--allowedTools "Read(${path})"` patterns to
-scope Claude's access to only the dropped files.
+Since file content is embedded in the prompt, Claude doesn't need `Read`
+tool access for dropped files. This also avoids the `dontAsk` limitation
+where Claude can't read files outside the project directory.
 
 ### Native File Dialogs
 
@@ -1322,13 +1423,19 @@ the permission set to the app's purpose:
 |---|---|---|
 | Read-only analysis | `"Read,Glob,Grep"` | Safe default for file inspection |
 | Code modification | `"Read,Edit,Write,Glob,Grep,Bash"` | Full dev toolkit |
-| Pure reasoning | `""` (empty string) | No filesystem access at all |
+| Pure reasoning | Omit `--tools` entirely | Don't use `--tools ""` — it's fragile |
 | Web research | `"WebSearch,WebFetch"` | Internet access, no local files |
 | Scoped read | `--allowedTools "Read(/src/**)"` | Only specific directories |
 
-Always pair `--permission-mode dontAsk` with an explicit `--tools` list.
-`dontAsk` auto-denies anything not whitelisted — without a tools list, Claude
-can't use any tools at all.
+Use `--permission-mode bypassPermissions` for desktop apps. `dontAsk`
+auto-denies anything not whitelisted AND blocks reads outside the project
+directory — dropped files from the user's desktop or home folder won't be
+accessible. Since desktop Loom apps control the prompt and tools list,
+`bypassPermissions` with an explicit `--tools` list is the right choice.
+
+If you need to read files the user drops, the better approach is to read
+them in the Bun process (via `FileReader` → RPC) and include the content
+directly in the prompt. See the File Drag-and-Drop section.
 
 ## Distribution
 
@@ -1445,29 +1552,43 @@ buffer += decoder.decode(chunk, { stream: true });
 The `{ stream: true }` option tells the decoder to hold incomplete byte
 sequences for the next chunk.
 
-### 4. `dontAsk` needs `--tools`
+### 4. `dontAsk` blocks reads outside project dir
 
-`--permission-mode dontAsk` auto-denies everything not explicitly allowed.
-Without a `--tools` list, Claude can't use any tools at all — not even Read.
-Always pair them:
+`--permission-mode dontAsk` auto-denies everything not explicitly allowed,
+including reads outside the project directory. If a user drops a file from
+`~/Desktop` onto your app and Claude tries to `Read` it, `dontAsk` will
+deny the request.
 
-```bash
-claude -p --permission-mode dontAsk --tools "Read,Glob,Grep" "analyze this"
-```
+**Solution:** Use `--permission-mode bypassPermissions` instead for desktop
+apps. You control the prompt and tools list, so `bypassPermissions` is safe
+and avoids the filesystem scope restriction.
 
-With an empty string (`--tools ""`), Claude runs as pure chat with no tool
-access. This is valid for reasoning-only tasks.
+**Alternative:** Read files in the Bun process (via `FileReader` in the
+webview → RPC → Bun), and include the content directly in the prompt. This
+way Claude doesn't need `Read` access at all for dropped files.
+
+`--tools ""` (empty string) is also fragile — it can cause ambiguous CLI
+behavior. For pure reasoning tasks, omit `--tools` entirely.
 
 ### 5. Extended thinking models
 
-Models with extended thinking (like haiku-4.5) deliver text as complete
-`assistant` content blocks — not incremental `stream_event` deltas. Your
-stream handler must process both:
+Models with extended thinking (haiku-4.5, sonnet-4.6, and others) deliver
+text as complete `assistant` content blocks — not incremental `stream_event`
+deltas. The `assistant` event arrives with an array like
+`[{type:"thinking"}, {type:"text"}]`. The thinking block has no visible
+output, so the UI looks "stuck" until the text block arrives.
 
-- `assistant` events with `message.content[].type === "text"` blocks
-- `stream_event` events with `event.delta.text` deltas
+Your stream handler must process both delivery patterns:
 
-The `deriveAndSendRPC` function above handles both patterns.
+- `assistant` events with `message.content[].type === "text"` blocks (thinking models)
+- `stream_event` events with `event.delta.text` deltas (non-thinking models)
+
+Filter out `type: "thinking"` blocks — they contain no user-visible content.
+The `deriveAndSendRPC` function above handles both patterns by checking
+`block.type === "text"` and ignoring thinking blocks.
+
+If the UI appears frozen during the thinking phase, show a "Thinking..."
+indicator via the `status` heartbeat messages.
 
 ### 6. RPC request timeout
 
@@ -1504,6 +1625,99 @@ platforms. For consistent rendering, consider enabling CEF (Chromium Embedded
 Framework) via the `bundleCEF` build option — but this increases bundle size
 significantly.
 
+### 9. Spawned Claude inherits user hooks
+
+`claude -p` loads `~/.claude/` hooks and settings (superpowers, vibes, etc.)
+by default. This adds seconds of startup time and massive prompt bloat from
+skill SessionStart hooks.
+
+**Fix:** Add `--setting-sources ""` to skip user and project settings entirely.
+This flag tells the CLI to not load any settings files, which prevents hooks
+from running on the spawned process.
+
+```bash
+claude -p --setting-sources "" --permission-mode bypassPermissions "task"
+```
+
+**Do NOT use** `--no-user-config` — that flag doesn't exist and will cause
+an error. `--setting-sources ""` is the correct way to skip settings.
+
+### 10. Missing index.html
+
+ElectroBun bundles JavaScript and CSS from your entrypoints but does NOT
+auto-generate an HTML file. The webview loads `views://mainview/index.html`,
+so you must create it manually.
+
+Create `src/mainview/index.html`:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>My Claude App</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="index.js"></script>
+</body>
+</html>
+```
+
+Then add a `copy` directive to `electrobun.config.ts` so the HTML file is
+included in the build:
+
+```typescript
+build: {
+  views: {
+    mainview: {
+      entrypoint: "src/mainview/index.ts",
+      copy: ["src/mainview/index.html"],
+    },
+  },
+},
+```
+
+Without this, the webview loads a blank page with no error message.
+
+### 11. stderr is a ReadableStream — read it once
+
+`proc.stderr` is a `ReadableStream`. If you consume it in one place (e.g.,
+a diagnostic reader), any subsequent attempt to read it (e.g., in an error
+handler) will throw `ReadableStream already used`.
+
+**Fix:** Collect stderr proactively into a buffer variable, then reference
+the buffer in error handlers:
+
+```typescript
+const stderrChunks: string[] = [];
+const stderrDecoder = new TextDecoder();
+(async () => {
+  const reader = proc.stderr.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      stderrChunks.push(stderrDecoder.decode(value, { stream: true }));
+    }
+  } catch {}
+})();
+
+// Later, in error handler:
+const stderr = stderrChunks.join("");
+```
+
+### 12. `File.path` doesn't exist in system webviews
+
+`File.path` is an Electron-specific extension. In WKWebView (macOS),
+WebView2 (Windows), and WebKit2GTK (Linux), dropped files do NOT have a
+`.path` property. Accessing it returns `undefined`.
+
+**Fix:** Use `FileReader.readAsText()` in the webview to read file content,
+then send the content to the Bun process over RPC. See the File
+Drag-and-Drop section for the complete pattern.
+
 ## What to Generate
 
 When you build the app, produce:
@@ -1512,8 +1726,9 @@ When you build the app, produce:
 - [ ] `src/bun/index.ts` — Main process entry: startup CLI check, window creation, menu setup
 - [ ] `src/bun/claude-manager.ts` — `cleanEnv()`, `createStreamParser()`, `spawnClaude()`, `abort()`, heartbeat, `deriveAndSendRPC()`
 - [ ] `src/bun/rpc.ts` — RPC schema type definition (`LoomRPC`) and `BrowserView.defineRPC<LoomRPC>()` with handlers
-- [ ] `src/mainview/index.ts` — Webview entry point with `Electroview<LoomRPC>` setup
-- [ ] `src/mainview/App.tsx` — React UI (or vanilla HTML) with message handlers and task controls
+- [ ] `src/mainview/index.html` — HTML shell (ElectroBun does NOT auto-generate this)
+- [ ] `src/mainview/index.ts` — Webview entry point with `Electroview.defineRPC<LoomRPC>()` + `new Electroview({ rpc })` setup
+- [ ] `src/mainview/App.tsx` — React UI (or vanilla HTML) with `handlers.messages` callbacks and task controls
 - [ ] Startup CLI check — verify `claude --version` succeeds, show setup screen if missing
 - [ ] Error handling for process crashes — `proc.exited` check, stderr capture, `error` RPC message
 

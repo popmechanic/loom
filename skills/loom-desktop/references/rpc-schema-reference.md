@@ -84,15 +84,17 @@ import { BrowserView, BrowserWindow } from "electrobun/bun";
 
 const rpc = BrowserView.defineRPC<LoomRPC>({
   handlers: {
-    startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
-      const taskId = crypto.randomUUID();
-      // Spawn claude -p (see SKILL.md patterns)
-      spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId });
-      return { taskId };
-    },
-    abort: async ({ taskId }) => {
-      const success = abortTask(taskId);
-      return { success };
+    requests: {
+      startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
+        const taskId = crypto.randomUUID();
+        // Spawn claude -p (see SKILL.md patterns)
+        spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId });
+        return { taskId };
+      },
+      abort: async ({ taskId }) => {
+        const success = abortTask(taskId);
+        return { success };
+      },
     },
   },
 });
@@ -104,13 +106,13 @@ From any Bun-side code that has the `rpc` reference:
 
 ```typescript
 // Send a token
-rpc.send.token({ taskId, text: "Hello from Claude" });
+rpc.sendProxy.token({ taskId, text: "Hello from Claude" });
 
 // Send tool use notification
-rpc.send.toolUse({ taskId, tool: "Read", input: { file_path: "/src/index.ts" } });
+rpc.sendProxy.toolUse({ taskId, tool: "Read", input: { file_path: "/src/index.ts" } });
 
 // Send tool result
-rpc.send.toolResult({
+rpc.sendProxy.toolResult({
   taskId,
   tool: "Read",
   output: "file contents...",
@@ -118,7 +120,7 @@ rpc.send.toolResult({
 });
 
 // Send status heartbeat
-rpc.send.status({
+rpc.sendProxy.status({
   taskId,
   state: "running",
   detail: "Reading src/index.ts",
@@ -127,10 +129,10 @@ rpc.send.status({
 });
 
 // Signal completion
-rpc.send.done({ taskId, cost: 0.03, duration: 5200 });
+rpc.sendProxy.done({ taskId, cost: 0.03, duration: 5200 });
 
 // Signal error
-rpc.send.error({ taskId, message: "Process exited with code 1" });
+rpc.sendProxy.error({ taskId, message: "Process exited with code 1" });
 ```
 
 ### Wiring RPC to a window
@@ -150,12 +152,28 @@ const win = new BrowserWindow({
 
 ### Setting up the Electroview
 
-In the webview entry point, create an `Electroview` instance with the same schema:
+In the webview entry point, define message handlers via `Electroview.defineRPC()`
+then create the instance. **Note:** `new Electroview<T>()` (generic-only form)
+will crash — you must pass `{ rpc }`:
 
 ```typescript
 import { Electroview } from "electrobun/view";
 
-const electrobun = new Electroview<LoomRPC>();
+// Define RPC with message handlers (NOT electrobun.rpc.on.* — that doesn't exist)
+const rpc = Electroview.defineRPC<LoomRPC>({
+  handlers: {
+    messages: {
+      token: ({ taskId, text }) => appendToOutput(taskId, text),
+      toolUse: ({ taskId, tool, input }) => showToolIndicator(taskId, tool, input),
+      toolResult: ({ taskId, tool, output, isError }) => updateToolResult(taskId, tool, output, isError),
+      done: ({ taskId, cost, duration }) => markComplete(taskId, cost, duration),
+      error: ({ taskId, message }) => showError(taskId, message),
+      status: ({ taskId, state, detail, elapsedMs }) => updateStatusBar(taskId, state, detail, elapsedMs),
+    },
+  },
+});
+
+const electrobun = new Electroview({ rpc });
 ```
 
 ### Sending requests to Bun
@@ -177,39 +195,27 @@ const { success } = await electrobun.rpc.request.abort({ taskId });
 
 ### Receiving messages from Bun
 
-Register handlers for each message type:
+Messages are handled via the `handlers.messages` object in `Electroview.defineRPC()`.
+There is **no** `electrobun.rpc.on.*` event API. Define all message handlers
+upfront when calling `defineRPC`:
 
 ```typescript
-// Listen for streaming tokens
-electrobun.rpc.on.token(({ taskId, text }) => {
-  appendToOutput(taskId, text);
-});
-
-// Listen for tool usage
-electrobun.rpc.on.toolUse(({ taskId, tool, input }) => {
-  showToolIndicator(taskId, tool, input);
-});
-
-// Listen for tool results
-electrobun.rpc.on.toolResult(({ taskId, tool, output, isError }) => {
-  updateToolResult(taskId, tool, output, isError);
-});
-
-// Listen for completion
-electrobun.rpc.on.done(({ taskId, cost, duration }) => {
-  markComplete(taskId, cost, duration);
-});
-
-// Listen for errors
-electrobun.rpc.on.error(({ taskId, message }) => {
-  showError(taskId, message);
-});
-
-// Listen for status heartbeats
-electrobun.rpc.on.status(({ taskId, state, detail, elapsedMs }) => {
-  updateStatusBar(taskId, state, detail, elapsedMs);
+const rpc = Electroview.defineRPC<LoomRPC>({
+  handlers: {
+    messages: {
+      token: ({ taskId, text }) => { /* handle streaming token */ },
+      toolUse: ({ taskId, tool, input }) => { /* handle tool invocation */ },
+      toolResult: ({ taskId, tool, output, isError }) => { /* handle tool result */ },
+      done: ({ taskId, cost, duration }) => { /* handle completion */ },
+      error: ({ taskId, message }) => { /* handle error */ },
+      status: ({ taskId, state, detail, elapsedMs }) => { /* handle heartbeat */ },
+    },
+  },
 });
 ```
+
+To bridge into React state, use module-level callback refs that the component
+sets on mount (see the pattern in SKILL.md).
 
 ### Minimal React component
 
@@ -217,7 +223,28 @@ electrobun.rpc.on.status(({ taskId, state, detail, elapsedMs }) => {
 import { useState, useEffect } from "react";
 import { Electroview } from "electrobun/view";
 
-const electrobun = new Electroview<LoomRPC>();
+// Module-level callback refs — set by React component on mount
+const callbacks = {
+  onToken: null as ((data: { text: string }) => void) | null,
+  onStatus: null as ((data: { state: string; detail?: string }) => void) | null,
+  onDone: null as (() => void) | null,
+  onError: null as ((data: { message: string }) => void) | null,
+};
+
+const rpc = Electroview.defineRPC<LoomRPC>({
+  handlers: {
+    messages: {
+      token: (data) => callbacks.onToken?.(data),
+      toolUse: () => {},
+      toolResult: () => {},
+      status: (data) => callbacks.onStatus?.(data),
+      done: () => callbacks.onDone?.(),
+      error: (data) => callbacks.onError?.(data),
+    },
+  },
+});
+
+const electrobun = new Electroview({ rpc });
 
 function App() {
   const [output, setOutput] = useState("");
@@ -225,18 +252,18 @@ function App() {
   const [taskId, setTaskId] = useState<string | null>(null);
 
   useEffect(() => {
-    electrobun.rpc.on.token(({ text }) => {
-      setOutput((prev) => prev + text);
-    });
-    electrobun.rpc.on.status(({ state, detail }) => {
+    callbacks.onToken = ({ text }) => setOutput((prev) => prev + text);
+    callbacks.onStatus = ({ state, detail }) => {
       setStatus(detail ? `${state}: ${detail}` : state);
-    });
-    electrobun.rpc.on.done(() => {
-      setStatus("done");
-    });
-    electrobun.rpc.on.error(({ message }) => {
-      setStatus(`error: ${message}`);
-    });
+    };
+    callbacks.onDone = () => setStatus("done");
+    callbacks.onError = ({ message }) => setStatus(`error: ${message}`);
+    return () => {
+      callbacks.onToken = null;
+      callbacks.onStatus = null;
+      callbacks.onDone = null;
+      callbacks.onError = null;
+    };
   }, []);
 
   async function runTask() {

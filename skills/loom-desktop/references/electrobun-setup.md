@@ -161,7 +161,9 @@ import { BrowserView } from "electrobun/bun";
 
 const rpc = BrowserView.defineRPC<MySchema>({
   handlers: {
-    startTask: async ({ prompt }) => { /* ... */ },
+    requests: {
+      startTask: async ({ prompt }) => { /* ... */ },
+    },
   },
 });
 ```
@@ -170,8 +172,8 @@ const rpc = BrowserView.defineRPC<MySchema>({
 
 The typed bridge between Bun and webview. Define a schema, register handlers on the Bun side, call them from the webview:
 
-- **Bun side**: `BrowserView.defineRPC<Schema>()` — define handlers for requests from the webview, send messages to the webview
-- **Webview side**: `new Electroview({ rpc: Schema })` — call requests on the Bun process, receive messages
+- **Bun side**: `BrowserView.defineRPC<Schema>({ handlers: { requests: { ... } } })` — define request handlers, send messages via `rpc.sendProxy.*`
+- **Webview side**: `Electroview.defineRPC<Schema>({ handlers: { messages: { ... } } })` + `new Electroview({ rpc })` — receive messages via handlers, call requests on the Bun process. **Note:** `new Electroview<T>()` (generic-only form) crashes — must pass `{ rpc }`
 
 See `@references/rpc-schema-reference.md` for the full typed contract.
 

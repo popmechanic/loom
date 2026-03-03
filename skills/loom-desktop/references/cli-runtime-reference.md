@@ -127,8 +127,11 @@ Use cases: data extraction pipelines, form automation, type-safe agentic outputs
 ## Tool Configuration
 
 ### Disable all tools (pure LLM, no file access)
+
+**Warning:** `--tools ""` is fragile and can cause ambiguous CLI behavior.
+Prefer omitting `--tools` entirely and using `--permission-mode bypassPermissions`:
 ```bash
-claude -p --tools "" "Just chat with me"
+claude -p --permission-mode bypassPermissions "Just chat with me"
 ```
 
 ### Whitelist specific tools
@@ -420,7 +423,7 @@ claude -p --model opus "complex task"          # Best quality
 | JSON response | `claude -p --output-format json "query"` |
 | Streaming | `claude -p --output-format stream-json --verbose "query"` |
 | Structured data | `claude -p --output-format json --json-schema '{...}' "query"` |
-| No tools (pure LLM) | `claude -p --tools "" "query"` |
+| No tools (pure LLM) | `claude -p --permission-mode bypassPermissions "query"` |
 | Full autonomy | `claude -p --permission-mode bypassPermissions "query"` |
 | Ephemeral | `claude -p --no-session-persistence "query"` |
 | Custom persona | `claude -p --system-prompt "You are..." "query"` |
@@ -430,6 +433,7 @@ claude -p --model opus "complex task"          # Best quality
 | With fallback | `claude -p --model sonnet --fallback-model haiku "query"` |
 | Budget cap | `claude -p --max-budget-usd 5 "query"` |
 | Turn limit | `claude -p --max-turns 10 "query"` |
+| Skip user hooks/settings | `claude -p --setting-sources "" "query"` |
 | Continue session | `claude -p --continue "follow up"` |
 | Resume session | `claude -p --resume UUID "continue"` |
 
@@ -441,5 +445,8 @@ claude -p --model opus "complex task"          # Best quality
 4. `structured_output` is separate from `result` in JSON output
 5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start)
 6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
-7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`.
+7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`. Also, `dontAsk` blocks reads outside the project directory — prefer `bypassPermissions` for desktop apps.
 8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
+9. **User hooks bloat spawned processes** — `claude -p` loads `~/.claude/` hooks and settings by default, adding seconds of startup and massive prompt bloat. Fix: `--setting-sources ""` skips all user/project settings. Do NOT use `--no-user-config` — that flag doesn't exist.
+10. **`--tools ""` is fragile** — Empty string tools arg can cause ambiguous CLI behavior. For pure reasoning tasks, omit `--tools` entirely. For controlled tool access, use `--tools "Read,Glob"` with explicit list.
+11. **Extended thinking affects multiple models** — Not just haiku-4.5: sonnet-4.6 and others use extended thinking too. The `assistant` event arrives with `[{type:"thinking"}, {type:"text"}]` — the thinking block has no visible output, so the UI looks "stuck" until text arrives. Filter out thinking blocks in your stream handler.
