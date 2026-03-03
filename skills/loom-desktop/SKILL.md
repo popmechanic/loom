@@ -119,10 +119,10 @@ The typed RPC contract is defined once and shared between Bun and webview. See
 Scaffold an ElectroBun project:
 
 ```bash
-npx electrobun init hello-world
+bunx electrobun init hello-world
 cd myapp
 bun install
-electrobun dev
+bunx electrobun dev
 ```
 
 This gives you a running app with a Bun process and webview. From here, you'll
@@ -219,6 +219,50 @@ Default to **TypeScript** for both the Bun process and the webview. Use
 
 Every pattern below uses these helpers. Define them once in a shared module
 (e.g., `src/bun/claude-manager.ts`).
+
+**`resolveClaudePath()`** — Find the absolute path to `claude` at startup.
+
+macOS GUI apps don't inherit the shell's PATH. Without this, the app works
+in dev (launched from terminal) but fails when distributed and opened from
+Finder. Always include this and use `CLAUDE_BIN` in all `Bun.spawn()` calls.
+
+```typescript
+function resolveClaudePath(): string {
+  // Try interactive login shell (sources both .zprofile AND .zshrc)
+  for (const flags of ["-lic", "-lc", "-ic"]) {
+    try {
+      const result = Bun.spawnSync(["zsh", flags, "which claude"], {
+        timeout: 5000,
+      });
+      const resolved = result.stdout.toString().trim();
+      if (resolved && result.exitCode === 0 && !resolved.includes("not found")) {
+        return resolved;
+      }
+    } catch {}
+  }
+
+  // Direct path check — common install locations
+  const home = process.env.HOME || "";
+  const candidates = [
+    `${home}/.claude/local/claude`,
+    `/usr/local/bin/claude`,
+    `/opt/homebrew/bin/claude`,
+    `${home}/.local/bin/claude`,
+    `${home}/.npm-global/bin/claude`,
+  ];
+
+  for (const p of candidates) {
+    try {
+      const file = Bun.file(p);
+      if (file.size > 0) return p;
+    } catch {}
+  }
+
+  return "claude"; // fallback (works if launched from terminal)
+}
+
+const CLAUDE_BIN = resolveClaudePath();
+```
 
 **`cleanEnv()`** — Remove nesting guards so `claude -p` can start.
 
@@ -1442,7 +1486,7 @@ directly in the prompt. See the File Drag-and-Drop section.
 ### Build
 
 ```bash
-electrobun build --env=stable
+bunx electrobun build --env=stable
 ```
 
 This produces a self-extracting archive (~12MB — the Bun runtime is the main
@@ -1455,7 +1499,24 @@ Build environments:
 - **`stable`** — Production-ready with full signing and distribution artifacts
 
 Builds always target the current host platform and architecture. Cross-compilation
-is not supported — build on macOS for macOS, Windows for Windows.
+is not supported — build on macOS for macOS, Windows for Windows. If the user
+wants to share with someone on a different architecture (e.g., Apple Silicon
+app to an Intel Mac user), the recipient must build from source on their machine.
+
+### Sharing the Build
+
+**Always use the DMG, never a ZIP.** Zipping a `.app` bundle strips executable
+permissions from binaries in `Contents/MacOS/`. The recipient opens the app and
+nothing happens — the `MacOS/` folder appears empty. DMGs are disk images that
+preserve file permissions, structure, and signatures exactly.
+
+The build produces a DMG at:
+```
+artifacts/stable-macos-arm64-symmetry-terminal.dmg
+```
+
+Without code signing, the recipient must run `xattr -cr /path/to/app.app`
+after dragging the app out of the DMG.
 
 ### Claude CLI as External Dependency
 
@@ -1464,11 +1525,94 @@ licensing, and the user needs it configured with their own credentials. The
 startup check pattern (shown in Pattern 2) handles the missing case gracefully
 by showing a setup screen with install instructions.
 
-### Code Signing
+### App Icon
 
-**macOS** — ElectroBun supports notarization via the `codesign` and `notarize`
-options in `electrobun.config.ts`. You'll need an Apple Developer account and
-a signing certificate. See ElectroBun docs for configuration.
+To add a custom app icon:
+
+1. Start with a 1024x1024 PNG source image.
+
+2. Generate all required sizes:
+
+```bash
+mkdir icon.iconset
+sips -z 1024 1024 source.png --out icon.iconset/icon_512x512@2x.png
+sips -z 512 512   source.png --out icon.iconset/icon_512x512.png
+sips -z 512 512   source.png --out icon.iconset/icon_256x256@2x.png
+sips -z 256 256   source.png --out icon.iconset/icon_256x256.png
+sips -z 256 256   source.png --out icon.iconset/icon_128x128@2x.png
+sips -z 128 128   source.png --out icon.iconset/icon_128x128.png
+sips -z 64 64     source.png --out icon.iconset/icon_32x32@2x.png
+sips -z 32 32     source.png --out icon.iconset/icon_32x32.png
+sips -z 32 32     source.png --out icon.iconset/icon_16x16@2x.png
+sips -z 16 16     source.png --out icon.iconset/icon_16x16.png
+```
+
+3. Add to `electrobun.config.ts`:
+
+```typescript
+mac: {
+  icons: "icon.iconset",
+},
+```
+
+### DMG Icon
+
+ElectroBun does not automatically set a volume icon on the DMG. To stamp
+your app icon onto the DMG file after building:
+
+```bash
+iconutil -c icns icon.iconset -o icon.icns
+sips -i icon.icns
+DeRez -only icns icon.icns > /tmp/icon.rsrc
+Rez -append /tmp/icon.rsrc -o artifacts/stable-macos-arm64-*.dmg
+SetFile -a C artifacts/stable-macos-arm64-*.dmg
+```
+
+### Code Signing & Notarization
+
+Without signing, macOS Gatekeeper blocks the app. The recipient can bypass
+with `xattr -cr`, but for clean distribution you need an Apple Developer
+account ($99/year).
+
+**Setup steps:**
+
+1. **Apple Developer Account** — enroll at [developer.apple.com](https://developer.apple.com)
+
+2. **Create signing certificate** — open Xcode > Settings > Accounts, add your
+   developer account, click Manage Certificates, create a **Developer ID
+   Application** certificate
+
+3. **Create App Identifier** — in the Apple Developer portal under Certificates,
+   Identifiers & Profiles > Identifiers, create one matching your app's
+   `identifier` (e.g., `com.loom.symmetry-terminal`). Check **App Attest**.
+
+4. **Generate app-specific password** — at [account.apple.com](https://account.apple.com)
+   under Sign-In and Security > App-Specific Passwords
+
+5. **Set environment variables** — add to `~/.zshrc`:
+
+```bash
+export ELECTROBUN_DEVELOPER_ID="Developer ID Application: Your Name (TEAMID)"
+export ELECTROBUN_TEAMID="TEAMID"
+export ELECTROBUN_APPLEID="your@email.com"
+export ELECTROBUN_APPLEIDPASS="xxxx-xxxx-xxxx-xxxx"
+```
+
+The `DEVELOPER_ID` is the full signing identity: certificate type + team
+name + team ID in parentheses. Find it in Xcode's certificate manager.
+
+6. **Enable in config:**
+
+```typescript
+mac: {
+  codesign: true,
+  notarize: true,
+},
+```
+
+7. **Build:** `bunx electrobun build --env=stable` — ElectroBun signs all
+   binaries, submits to Apple for notarization (takes 2-5 minutes), and
+   produces a DMG that opens cleanly on any Mac.
 
 **Windows** — Authenticode signing via the build configuration. Unsigned apps
 trigger SmartScreen warnings. See ElectroBun docs for certificate setup.
@@ -1718,6 +1862,77 @@ WebView2 (Windows), and WebKit2GTK (Linux), dropped files do NOT have a
 then send the content to the Bun process over RPC. See the File
 Drag-and-Drop section for the complete pattern.
 
+### 13. macOS GUI apps don't inherit shell PATH
+
+When launched from Finder (not terminal), the Bun process gets a minimal
+PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). `claude` installed via npm is
+typically at `/usr/local/bin/claude` or `~/.local/bin/claude` — neither
+of which is in the GUI PATH. The app launches fine but every `claude -p`
+spawn fails with "Executable not found in $PATH".
+
+**Fix:** Resolve the absolute path to `claude` once at startup using a
+login shell, then use it for all subsequent spawns:
+
+```typescript
+function resolveClaudePath(): string {
+  // Try interactive login shell (sources both .zprofile AND .zshrc)
+  for (const flags of ["-lic", "-lc", "-ic"]) {
+    try {
+      const result = Bun.spawnSync(["zsh", flags, "which claude"], {
+        timeout: 5000,
+      });
+      const resolved = result.stdout.toString().trim();
+      if (resolved && result.exitCode === 0 && !resolved.includes("not found")) {
+        return resolved;
+      }
+    } catch {}
+  }
+
+  // Direct path check — common install locations
+  const home = process.env.HOME || "";
+  const candidates = [
+    `${home}/.claude/local/claude`,
+    `/usr/local/bin/claude`,
+    `/opt/homebrew/bin/claude`,
+    `${home}/.local/bin/claude`,
+    `${home}/.npm-global/bin/claude`,
+  ];
+
+  for (const p of candidates) {
+    try {
+      const file = Bun.file(p);
+      if (file.size > 0) return p;
+    } catch {}
+  }
+
+  return "claude"; // fallback (works if launched from terminal)
+}
+
+const CLAUDE_BIN = resolveClaudePath();
+```
+
+Then use `CLAUDE_BIN` instead of `"claude"` in all `Bun.spawn()` calls.
+The login shell (`zsh -l`) sources `~/.zshrc` and picks up the full PATH.
+
+**Always include `resolveClaudePath()`** in every Loom desktop app. This
+is required for distribution — the app will work in dev (launched from
+terminal) but fail for end users who double-click it in Finder.
+
+### 14. ZIP strips executable permissions
+
+Never distribute a `.app` bundle via ZIP. Zipping strips executable
+permissions from binaries in `Contents/MacOS/`. The recipient opens the
+app and nothing happens — the `MacOS/` folder appears empty. Always use
+the DMG from `artifacts/`. DMGs are disk images that preserve permissions,
+structure, and code signatures exactly.
+
+### 15. No cross-compilation
+
+`bunx electrobun build` targets the current host platform and architecture
+only. An Apple Silicon build won't run on an Intel Mac (and vice versa).
+If the recipient has a different architecture, they must build from source
+on their own machine.
+
 ## What to Generate
 
 When you build the app, produce:
@@ -1736,8 +1951,18 @@ For simple apps, the Bun-side code fits in two files (`index.ts` + `claude-manag
 For complex apps, split RPC definitions, session management, and tray logic into
 separate modules.
 
-After generating, run `electrobun dev` and verify the app launches. Then iterate
+After generating, run `bunx electrobun dev` and verify the app launches. Then iterate
 based on what the person sees.
+
+**After the app is working**, ask the user if they'd like help building the
+executable for distribution. If yes, run `bunx electrobun build --env=stable`
+and explain:
+- The build artifacts land in `artifacts/`
+- Recipients need Claude CLI installed and authenticated on their machine
+- Without an Apple Developer certificate, macOS Gatekeeper will block the app —
+  the recipient can bypass with `xattr -cr /path/to/app.app` or right-click > Open
+- For proper distribution without warnings, configure code signing and
+  notarization in `electrobun.config.ts`
 
 ## The Possibility Space
 

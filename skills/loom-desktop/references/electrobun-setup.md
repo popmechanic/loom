@@ -14,7 +14,7 @@ A focused guide to scaffolding an ElectroBun project for Loom desktop apps.
 ElectroBun provides an interactive initializer with starter templates:
 
 ```bash
-npx electrobun init
+bunx electrobun init
 ```
 
 This prompts you to choose a template. Available templates:
@@ -101,13 +101,13 @@ Key sections:
 ### Start in dev mode
 
 ```bash
-electrobun dev
+bunx electrobun dev
 ```
 
 This builds and launches the app. Add `--watch` for auto-rebuild on source changes:
 
 ```bash
-electrobun dev --watch
+bunx electrobun dev --watch
 ```
 
 File changes trigger a rebuild after a 300ms debounce.
@@ -115,7 +115,7 @@ File changes trigger a rebuild after a 300ms debounce.
 ### Run without rebuilding
 
 ```bash
-electrobun run
+bunx electrobun run
 ```
 
 Launches the last-built dev bundle. Useful for quick relaunches without recompilation.
@@ -123,7 +123,7 @@ Launches the last-built dev bundle. Useful for quick relaunches without recompil
 ### Build for distribution
 
 ```bash
-electrobun build --env=stable
+bunx electrobun build --env=stable
 ```
 
 Build environments:
