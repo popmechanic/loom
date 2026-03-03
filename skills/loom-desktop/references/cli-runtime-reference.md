@@ -197,9 +197,15 @@ claude -p --resume "session-uuid" "continue work"
 ### Fixed session ID (multi-turn conversations)
 ```bash
 SESSION="$(uuidgen)"
+# First turn: --session-id creates the session
 echo "My name is Alice" | claude -p --session-id $SESSION --output-format json
-echo "What's my name?" | claude -p --session-id $SESSION --continue
+# Subsequent turns: --resume continues that specific session
+echo "What's my name?" | claude -p --resume $SESSION
 ```
+
+**Important:** Do NOT combine `--session-id` with `--continue` or `--resume` —
+this errors unless `--fork-session` is also specified. Use `--session-id` on
+the first turn to create the session, then `--resume <id>` on subsequent turns.
 
 ### Fork a session
 ```bash
@@ -450,3 +456,5 @@ claude -p --model opus "complex task"          # Best quality
 9. **User hooks bloat spawned processes** — `claude -p` loads `~/.claude/` hooks and settings by default, adding seconds of startup and massive prompt bloat. Fix: `--setting-sources ""` skips all user/project settings. Do NOT use `--no-user-config` — that flag doesn't exist.
 10. **`--tools ""` is fragile** — Empty string tools arg can cause ambiguous CLI behavior. For pure reasoning tasks, omit `--tools` entirely. For controlled tool access, use `--tools "Read,Glob"` with explicit list.
 11. **Extended thinking affects multiple models** — Not just haiku-4.5: sonnet-4.6 and others use extended thinking too. The `assistant` event arrives with `[{type:"thinking"}, {type:"text"}]` — the thinking block has no visible output, so the UI looks "stuck" until text arrives. Filter out thinking blocks in your stream handler.
+12. **`--session-id` + `--continue` errors** — Combining `--session-id` with `--continue` or `--resume` requires `--fork-session`. For multi-turn conversations, use `--session-id` on the first turn only, then `--resume <id>` on subsequent turns.
+13. **Claude reads images and PDFs natively** — The Read tool handles PNG, JPG, JPEG, GIF, WebP, BMP, and PDF files. For apps that accept file uploads or drops, save binary files to a temp directory and pass the file path in the prompt — Claude will use its Read tool to analyze them visually. Clean up temp files after the Claude process exits.

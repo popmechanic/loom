@@ -180,7 +180,7 @@ How does the person's action translate to a Claude invocation?
 |-------------|---------|
 | Click a button, get a result | **Synchronous** — spawn, collect, return |
 | Watch progress in real-time | **Streaming** — tokens flow as RPC messages |
-| Multi-step conversation with context | **Conversational** — `--session-id` + `--continue` |
+| Multi-step conversation with context | **Conversational** — `--session-id` first turn, `--resume <id>` after |
 | Long task, minimize to tray | **Background** — task registry + tray status |
 
 Most desktop apps start with Streaming. Add Conversational if the user needs
@@ -529,6 +529,7 @@ function spawnClaude(
     tools?: string[];
     maxBudget?: number;
     sessionId?: string;
+    isFirstTurn?: boolean;
   },
   rpc: any
 ) {
@@ -553,7 +554,11 @@ function spawnClaude(
     args.push("--tools", opts.tools.join(","));
   }
   if (opts.sessionId) {
-    args.push("--session-id", opts.sessionId, "--continue");
+    if (opts.isFirstTurn) {
+      args.push("--session-id", opts.sessionId);
+    } else {
+      args.push("--resume", opts.sessionId);
+    }
   }
   args.push(prompt);
 
@@ -878,7 +883,8 @@ silently fail — the user needs to know why the app isn't working.
 ### Pattern 3: Conversational (Multi-Turn)
 
 Multi-turn sessions where Claude retains context across messages. Uses
-`--session-id` and `--continue` flags. The Bun process maintains a session map.
+`--session-id` (first turn) and `--resume` (subsequent turns) flags. The Bun
+process maintains a session map.
 
 Use this for: code assistants where you ask follow-up questions, interactive
 debugging sessions, multi-step analysis that builds on previous answers.
@@ -933,11 +939,11 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
           });
         }
 
-        // spawnClaude already handles --session-id and --continue
-        // when opts.sessionId is provided
+        const isFirstTurn = !sessionId || !sessions.has(sessionId);
         spawnClaude(taskId, prompt, {
           model, tools, maxBudget,
           sessionId: actualSessionId,
+          isFirstTurn,
         }, rpc);
 
         return { taskId };

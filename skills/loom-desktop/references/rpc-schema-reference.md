@@ -326,7 +326,7 @@ Webview                        Bun
   │◄── done ────────────────────│
   │                             │
   │─── startTask(prompt, ──────►│   // Follow-up, with sessionId
-  │     sessionId) ─────────────│   // Bun spawns with --session-id <id> --continue
+  │     sessionId) ─────────────│   // Bun spawns with --resume <id>
   │◄── { taskId } ─────────────│
   │◄── ...tokens... ───────────│
   │◄── done ────────────────────│

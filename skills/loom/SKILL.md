@@ -105,7 +105,7 @@ How does the person's action translate to a Claude invocation?
 |-------------|----------------|
 | Click a button, get a result | One-shot `claude -p`, REST response |
 | Watch progress in real-time | Stream-JSON → SSE to browser |
-| Multi-step workflow with state | Session-based (`--session-id` + `--continue`) |
+| Multi-step workflow with state | Session-based (`--session-id` first turn, `--resume <id>` after) |
 | Concurrent analysis of multiple items | Parallel `claude -p` processes |
 | Person steers while Claude works | Bidirectional streaming via WebSocket |
 
@@ -121,6 +121,8 @@ Map each action to what Claude needs behind the scenes:
   adds to the default prompt (preserving user settings, skills, etc.) — use this
   when Claude should still act as a general assistant with extra instructions.
 - **What data?** Files on the server? User-uploaded content? Piped from other services?
+  Claude's Read tool natively handles images and PDFs — save uploaded binary
+  files to a temp directory and pass the path (see "Handling File Uploads" below).
 - **What output shape?** Free text for display? Structured JSON for rendering UI components?
   Both (use `--json-schema` for structured + `result` for narrative)?
 
@@ -488,6 +490,7 @@ const wss = new WebSocketServer({ port: 8080 });
 wss.on("connection", (ws) => {
   const sessionId = uuidv4();
   let activeProc: ChildProcess | null = null;
+  let isFirstTurn = true;
 
   ws.on("message", (raw) => {
     const { action, payload } = JSON.parse(raw.toString());
@@ -498,14 +501,22 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // First turn: --session-id creates the session
+    // Subsequent turns: --resume continues that specific session
+    const sessionArgs = isFirstTurn
+      ? ["--session-id", sessionId]
+      : ["--resume", sessionId];
+
     const proc = spawn("claude", [
       "-p", "--output-format", "stream-json", "--verbose",
       "--permission-mode", "dontAsk", "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
       "--max-budget-usd", "3", "--max-turns", "20",
-      "--session-id", sessionId, "--continue",
+      ...sessionArgs,
       "--model", "sonnet",
       payload.prompt
     ], { env: cleanEnv() });
+
+    isFirstTurn = false;
 
     proc.stdin.end();
     activeProc = proc;
@@ -920,6 +931,92 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 
 For long-running servers, consider a periodic sweep of your temp directory
 to catch orphaned files from crashed requests.
+
+### Handling File Uploads and Drops
+
+Claude's Read tool natively handles images (PNG, JPG, JPEG, GIF, WebP, BMP)
+and PDFs — it can see images visually and parse PDF pages. Apps that accept
+file uploads or drag-and-drop should categorize files into three tiers:
+
+| Category | Examples | Handling |
+|----------|----------|----------|
+| **Text** | `.ts`, `.md`, `.json`, `.csv` | Inline content in prompt via `<file>` tags |
+| **Claude-readable binary** | `.png`, `.jpg`, `.pdf`, `.gif`, `.webp`, `.bmp` | Save to temp dir, pass file path in prompt |
+| **Other binary** | `.zip`, `.exe`, `.mp4` | Text description only (name, type, size) |
+
+For Claude-readable binary files, save them to a temp directory and include
+the path in the prompt. Claude will use its Read tool to analyze them:
+
+```typescript
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import path from "path";
+
+const NATIVE_READ_EXTS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "pdf",
+]);
+
+function buildPromptWithFiles(
+  userMessage: string,
+  files: Array<{ name: string; content: string; passAsFile?: boolean }>,
+): { prompt: string; tempDir?: string } {
+  const textParts: string[] = [];
+  const filePaths: string[] = [];
+  let tempDir: string | undefined;
+
+  for (const f of files) {
+    if (f.passAsFile) {
+      if (!tempDir) tempDir = mkdtempSync(path.join(tmpdir(), "loom-"));
+      const filePath = path.join(tempDir, f.name);
+      writeFileSync(filePath, Buffer.from(f.content, "base64"));
+      filePaths.push(filePath);
+    } else {
+      textParts.push(`<file name="${f.name}">\n${f.content}\n</file>`);
+    }
+  }
+
+  const parts: string[] = [];
+  if (filePaths.length > 0) {
+    parts.push("Use your Read tool to examine these files:");
+    for (const p of filePaths) parts.push(p);
+  }
+  if (textParts.length > 0) parts.push("", ...textParts);
+  parts.push("", userMessage);
+
+  return { prompt: parts.join("\n"), tempDir };
+}
+```
+
+**Important:** Clean up the temp directory after the Claude process exits.
+Pass `tempDir` to your spawn function and call `rmSync(tempDir, { recursive: true })`
+in the cleanup handler.
+
+On the frontend (browser/webview), detect file type and base64-encode
+Claude-readable binary files before sending them to the server:
+
+```typescript
+const nativeReadExts = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "pdf",
+]);
+
+async function processDroppedFile(file: File) {
+  const ext = file.name.split(".").pop()?.toLowerCase() || "";
+  const isNativeReadable = nativeReadExts.has(ext)
+    || file.type.startsWith("image/")
+    || file.type === "application/pdf";
+
+  if (isNativeReadable) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return { name: file.name, content: btoa(binary), passAsFile: true };
+  }
+
+  // Fall through to text reading or binary description
+}
+```
 
 ### Advanced Patterns
 

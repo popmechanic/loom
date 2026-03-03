@@ -194,9 +194,15 @@ claude -p --resume "session-uuid" "continue work"
 ### Fixed session ID (multi-turn conversations)
 ```bash
 SESSION="$(uuidgen)"
+# First turn: --session-id creates the session
 echo "My name is Alice" | claude -p --session-id $SESSION --output-format json
-echo "What's my name?" | claude -p --session-id $SESSION --continue
+# Subsequent turns: --resume continues that specific session
+echo "What's my name?" | claude -p --resume $SESSION
 ```
+
+**Important:** Do NOT combine `--session-id` with `--continue` or `--resume` —
+this errors unless `--fork-session` is also specified. Use `--session-id` on
+the first turn to create the session, then `--resume <id>` on subsequent turns.
 
 ### Fork a session
 ```bash
@@ -443,3 +449,5 @@ claude -p --model opus "complex task"          # Best quality
 6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
 7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`.
 8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
+9. **`--session-id` + `--continue` errors** — Combining `--session-id` with `--continue` or `--resume` requires `--fork-session`. For multi-turn conversations, use `--session-id` on the first turn only, then `--resume <id>` on subsequent turns.
+10. **Claude reads images and PDFs natively** — The Read tool handles PNG, JPG, JPEG, GIF, WebP, BMP, and PDF files. For apps that accept file uploads or drops, save binary files to a temp directory and pass the file path in the prompt — Claude will use its Read tool to analyze them visually. Clean up temp files after the Claude process exits.
