@@ -1,16 +1,11 @@
 ---
 name: loom
 description: >
-  Build applications where Claude Code CLI (`claude -p`) is the runtime.
-  A server spawns Claude processes that read files, run commands, and return
-  structured output. A custom interface renders the results in whatever form
-  makes sense. Use when a user wants to build something with Claude as the
-  engine: any app that calls `claude -p` or uses the Agent SDK instead of a
-  traditional API backend. Triggers: "build an app that uses Claude",
-  "make something powered by Claude", "wrap claude -p", "Claude as backend",
-  "Claude as runtime", or any application needing Claude's agentic capabilities
-  (file access, tool use, streaming) through a purpose-built interface. NOT for
-  Anthropic API apps, chat replicas, or standard web apps without an AI runtime.
+  Build applications where Claude Code CLI (`claude -p`) or the Agent SDK is the
+  runtime — a server spawns Claude processes that power a custom interface.
+  Triggers: "build an app that uses Claude", "Claude as backend/runtime",
+  "wrap claude -p", or any app needing Claude's agentic capabilities through
+  a purpose-built interface. NOT for Anthropic API apps or chat replicas.
 ---
 
 # Loom: Applications on the Claude Code Runtime
@@ -215,7 +210,7 @@ Here are the server patterns to reach for:
 #### Safety Defaults
 
 Every pattern below runs Claude in a server — no human sitting at a terminal
-to approve tool use or notice runaway costs. Three flags are non-negotiable:
+to approve tool use. Three flags are non-negotiable:
 
 **`--permission-mode dontAsk`** — In a server context, there's nobody to click
 "approve." Without this flag, Claude hangs forever waiting for interactive
@@ -1505,13 +1500,14 @@ async function respondPermission(requestId, approved) {
 
 When you build the app, produce:
 
-1. **`server.ts`** — Express server with cookie-parser, session store,
+1. **`server.ts`** — Express server using the Server Setup block above
+   (express, cookie-parser, express.static). Includes session store,
    `requireAuth` middleware, OAuth endpoints (`/api/oauth/start`,
    `/api/oauth/exchange`, `/api/health`, `/api/logout`), and your app's
    endpoint pattern(s). The exchange endpoint must fetch the user's
    profile from `https://api.anthropic.com/v1/me` and store it in
-   the session. Each spawn uses `spawnEnvForUser()` to inject
-   the requesting user's token.
+   the session. Each spawn uses `spawnEnvForUser()` to inject the
+   requesting user's token.
 2. **`public/index.html`** — The frontend, starting with the `<SetupScreen>`
    component (shown when no session exists) and your app's main UI
    (shown after authentication). Must include a user indicator showing
@@ -1523,8 +1519,23 @@ When you build the app, produce:
    input and a setup screen input, use `input.setup-input` selectors
    (not `.setup-input`) to avoid CSS specificity conflicts with global
    `input[type="text"]` rules — see `references/oauth-reference.md`.
-3. **`package.json`** — Dependencies (including `cookie-parser`) and start script
+3. **`package.json`** — Dependencies (`express`, `cookie-parser`, `uuid`,
+   and `cors` if frontend/server are separate origins) and a start script
 4. **A one-liner to run it** — so the person can verify it works immediately
+
+### First-Run Reliability Checklist
+
+These are the silent-failure modes — things that break with NO error message.
+The inline patterns above demonstrate correct handling for each, but they're
+easy to miss or deviate from when generating a new app.
+
+- [ ] `--include-partial-messages` is on every streaming spawn — without it, text dumps as a single block instead of streaming token-by-token
+- [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
+- [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently when the server runs inside Claude Code
+- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
+- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false`, so unchecked it looks like success
+- [ ] `express.json()` middleware is applied before any route that reads `req.body` — without it, `req.body` is `undefined` and the spawn gets an empty prompt
+- [ ] 401 responses in the frontend redirect to the setup screen — in-memory sessions are wiped on server restart, and a 401 fed to the SSE parser fails silently
 
 For simple apps, a single `server.ts` serving a static `index.html` is ideal.
 For complex UIs, scaffold a React frontend with a separate server.
