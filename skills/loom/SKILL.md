@@ -396,6 +396,7 @@ app.post("/api/stream", (req, res) => {
 
   const proc = spawn("claude", [
     "-p", "--output-format", "stream-json", "--verbose",
+    "--include-partial-messages",
     "--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Bash",
     "--max-turns", "15",
     "--model", "sonnet", "--no-session-persistence",
@@ -405,23 +406,27 @@ app.post("/api/stream", (req, res) => {
   let gotResult = false;
 
   const parse = createStreamParser((event) => {
-    // Handle both streaming patterns:
-    // 1. Models with extended thinking (haiku-4.5) deliver text as complete
-    //    blocks in "assistant" events — no incremental stream_event tokens.
-    // 2. Other models may emit "stream_event" with incremental deltas.
-    if (event.type === "assistant" && event.message?.content) {
+    // With --include-partial-messages, tokens arrive as stream_event deltas.
+    // The assistant event re-delivers the complete text — DO NOT forward it
+    // or the frontend will display every token twice.
+    if (event.type === "stream_event" && event.event?.delta?.text) {
+      res.write(`data: ${JSON.stringify({ type: "token", text: event.event.delta.text })}\n\n`);
+    } else if (event.type === "assistant" && event.message?.content) {
+      // Only forward tool_use — text was already streamed via stream_event.
       for (const block of event.message.content) {
-        if (block.type === "text" && block.text) {
-          res.write(`data: ${JSON.stringify({ type: "token", text: block.text })}\n\n`);
-        } else if (block.type === "tool_use") {
+        if (block.type === "tool_use") {
           res.write(`data: ${JSON.stringify({ type: "tool", name: block.name })}\n\n`);
         }
       }
-    } else if (event.type === "stream_event" && event.event?.delta?.text) {
-      res.write(`data: ${JSON.stringify({ type: "token", text: event.event.delta.text })}\n\n`);
     } else if (event.type === "result") {
       gotResult = true;
-      res.write(`data: ${JSON.stringify({ type: "done", cost: event.total_cost_usd })}\n\n`);
+      if (event.is_error) {
+        res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
+      } else if (event.subtype === "error_max_turns") {
+        res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
+      } else {
+        res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+      }
     }
   });
 
@@ -469,9 +474,12 @@ app.post("/api/stream", (req, res) => {
   gets no signal that something went wrong.
 - Don't ignore `is_error` on the result — tool failures set
   `is_error: true` with `structured_output: null`.
-- Don't assume text arrives via `stream_event` only — models with extended
-  thinking (haiku-4.5) deliver text as complete blocks in `assistant` events.
-  Always handle both `assistant` text blocks and `stream_event` deltas.
+- Don't omit `--include-partial-messages` — without it, text arrives as a
+  single complete block in `assistant` events instead of token-by-token
+  `stream_event` deltas. This makes streaming apps feel broken.
+- Don't forward text from `assistant` events when using `--include-partial-messages`
+  — the same text was already delivered token-by-token via `stream_event`. Only
+  forward `tool_use` blocks from `assistant` events, or text will appear twice.
 
 #### Pattern: WebSocket Session
 
@@ -506,6 +514,7 @@ wss.on("connection", (ws) => {
 
     const proc = spawn("claude", [
       "-p", "--output-format", "stream-json", "--verbose",
+      "--include-partial-messages",
       "--permission-mode", "dontAsk", "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
       "--max-turns", "20",
       ...sessionArgs,
@@ -521,19 +530,27 @@ wss.on("connection", (ws) => {
     let gotResult = false;
 
     const parse = createStreamParser((event) => {
-      if (event.type === "assistant" && event.message?.content) {
+      // With --include-partial-messages, tokens arrive as stream_event deltas.
+      // The assistant event re-delivers the complete text — DO NOT forward it
+      // or the frontend will display every token twice.
+      if (event.type === "stream_event" && event.event?.delta?.text) {
+        ws.send(JSON.stringify({ type: "token", text: event.event.delta.text }));
+      } else if (event.type === "assistant" && event.message?.content) {
+        // Only forward tool_use — text was already streamed via stream_event.
         for (const block of event.message.content) {
-          if (block.type === "text" && block.text) {
-            ws.send(JSON.stringify({ type: "token", text: block.text }));
-          } else if (block.type === "tool_use") {
+          if (block.type === "tool_use") {
             ws.send(JSON.stringify({ type: "tool", name: block.name, input: block.input }));
           }
         }
-      } else if (event.type === "stream_event" && event.event?.delta?.text) {
-        ws.send(JSON.stringify({ type: "token", text: event.event.delta.text }));
       } else if (event.type === "result") {
         gotResult = true;
-        ws.send(JSON.stringify({ type: "done", result: event }));
+        if (event.is_error) {
+          ws.send(JSON.stringify({ type: "error", message: event.result }));
+        } else if (event.subtype === "error_max_turns") {
+          ws.send(JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" }));
+        } else {
+          ws.send(JSON.stringify({ type: "done" }));
+        }
       }
     });
 
@@ -585,6 +602,7 @@ app.post("/api/jobs", (req, res) => {
 
   const proc = spawn("claude", [
     "-p", "--output-format", "stream-json", "--verbose",
+    "--include-partial-messages",
     "--model", "sonnet", "--max-turns", "20",
     "--permission-mode", "dontAsk",
     "--tools", "Read,Bash,Glob,Grep",
@@ -599,7 +617,13 @@ app.post("/api/jobs", (req, res) => {
 
   const parse = createStreamParser((event) => {
     if (event.type === "result") {
-      jobs.set(jobId, { status: "complete", result: event });
+      if (event.is_error) {
+        jobs.set(jobId, { status: "failed", error: event.result });
+      } else if (event.subtype === "error_max_turns") {
+        jobs.set(jobId, { status: "incomplete", result: event });
+      } else {
+        jobs.set(jobId, { status: "complete", result: event });
+      }
     }
   });
 
@@ -1078,6 +1102,7 @@ function startSession(systemPrompt?: string) {
     "-p",
     "--input-format", "stream-json",
     "--output-format", "stream-json", "--verbose",
+    "--include-partial-messages",
     "--permission-mode", "dontAsk",
     "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
   ];
@@ -1090,8 +1115,23 @@ function startSession(systemPrompt?: string) {
   sessionActive = true;
 
   const parse = createStreamParser((event) => {
-    // Forward events to SSE/WebSocket clients
-    broadcast(event);
+    if (event.type === "stream_event" && event.event?.delta?.text) {
+      broadcast({ type: "token", text: event.event.delta.text });
+    } else if (event.type === "assistant" && event.message?.content) {
+      for (const block of event.message.content) {
+        if (block.type === "tool_use") {
+          broadcast({ type: "tool", name: block.name, input: block.input });
+        }
+      }
+    } else if (event.type === "result") {
+      if (event.is_error) {
+        broadcast({ type: "error", message: event.result });
+      } else if (event.subtype === "error_max_turns") {
+        broadcast({ type: "warning", message: "Task incomplete — reached turn limit" });
+      } else {
+        broadcast({ type: "done" });
+      }
+    }
   });
   proc.stdout!.on("data", parse);
   proc.stderr!.on("data", (chunk) => console.error(`[claude] ${chunk}`));
