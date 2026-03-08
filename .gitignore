@@ -8,6 +8,9 @@ loom-workspace/
 tests/
 explainer.html
 
+# Worktrees
+.worktrees/
+
 # Build artifacts
 *.skill
 node_modules/
