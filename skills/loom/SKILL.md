@@ -310,6 +310,29 @@ function createStreamParser(onEvent: (event: any) => void) {
 Use `TextDecoder` with `{ stream: true }` — not `chunk.toString()` — to
 handle multi-byte UTF-8 characters that split across chunk boundaries.
 
+#### Server Setup
+
+Every pattern below assumes this baseline Express setup. Define it once at
+the top of your server file, alongside the shared utilities above.
+
+```typescript
+import express from "express";
+import cookieParser from "cookie-parser";
+import path from "path";
+
+const app = express();
+app.use(express.json());
+app.use(cookieParser());
+app.use(express.static(path.join(__dirname, "public")));
+
+// If frontend and server run on different ports (e.g., Vite dev + Express API):
+// import cors from "cors";
+// app.use(cors({ origin: "http://localhost:5173" }));
+
+const PORT = process.env.PORT || 3456;
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+```
+
 #### Pattern: REST Endpoint (One-Shot)
 
 Someone triggers an action → server calls Claude → returns JSON.
@@ -323,8 +346,6 @@ app.use(express.json());
 
 app.post("/api/analyze", (req, res) => {
   const { content, task } = req.body;
-
-  const env = cleanEnv();
 
   const schema = JSON.stringify({
     type: "object",
@@ -526,7 +547,6 @@ wss.on("connection", (ws) => {
 
     proc.stdin.end();
     activeProc = proc;
-    let lineBuf = "";
     let gotResult = false;
 
     const parse = createStreamParser((event) => {
@@ -612,7 +632,6 @@ app.post("/api/jobs", (req, res) => {
   proc.stdin.write(req.body.task);
   proc.stdin.end();
 
-  let lineBuf = "";
   let stderrBuf = "";
 
   const parse = createStreamParser((event) => {
@@ -795,10 +814,12 @@ async function streamTask(task) {
     buffer = lines.pop(); // keep incomplete chunk
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
-      const data = JSON.parse(line.slice(6));
-      if (data.type === "token") output.textContent += data.text;
-      else if (data.type === "done") document.getElementById("cost").textContent = `$${data.cost.toFixed(4)}`;
-      else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
+      try {
+        const data = JSON.parse(line.slice(6));
+        if (data.type === "token") output.textContent += data.text;
+        else if (data.type === "done") { /* stream complete */ }
+        else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
+      } catch { /* malformed SSE data — skip */ }
     }
   }
 }
@@ -1060,24 +1081,34 @@ async function extract<T>(prompt: string, schema: object, timeoutMs = 30000): Pr
     "--permission-mode", "dontAsk"
   ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv() });
 
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+
+  let stdout = "";
+  let stderr = "";
+  proc.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+  proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+  // Register close listener BEFORE writing to stdin — a fast process
+  // could exit before the listener is attached otherwise.
+  const exitCode = new Promise<number | null>(r => proc.on("close", r));
+
   proc.stdin.write(prompt);
   proc.stdin.end();
 
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
-
   try {
-    let stdout = "";
-    for await (const chunk of proc.stdout) stdout += chunk.toString();
-    const exitCode = await new Promise<number>(r => proc.on("close", r));
-    if (exitCode !== 0) {
-      let stderr = "";
-      for await (const chunk of proc.stderr) stderr += chunk.toString();
-      throw new Error(`Extraction failed (exit ${exitCode}): ${stderr.slice(0, 200)}`);
+    const code = await exitCode;
+    if (code !== 0) {
+      throw new Error(`Extraction failed (exit ${code}): ${stderr.slice(0, 200)}`);
     }
     const wrapper = JSON.parse(stdout);
+    if (wrapper.is_error) throw new Error(wrapper.result);
     if (wrapper.structured_output) return wrapper.structured_output as T;
-    if (typeof wrapper.result === "string") return JSON.parse(wrapper.result) as T;
-    return wrapper as T;
+    try { return JSON.parse(wrapper.result) as T; } catch {
+      // result is not JSON — return the wrapper itself as a last resort.
+      // This handles edge cases where structured_output is absent but
+      // the operation succeeded with a plain-text result.
+      return wrapper as T;
+    }
   } finally {
     clearTimeout(timer);
   }
