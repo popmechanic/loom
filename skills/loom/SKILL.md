@@ -333,11 +333,8 @@ app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`)
 Someone triggers an action → server calls Claude → returns JSON.
 
 ```typescript
-import express from "express";
+// Uses Server Setup block above — app, express.json(), etc. already defined.
 import { execFileSync } from "child_process";
-
-const app = express();
-app.use(express.json());
 
 app.post("/api/analyze", (req, res) => {
   const { content, task } = req.body;
@@ -691,11 +688,10 @@ app.post("/api/batch", async (req, res) => {
       let stdout = "";
       let stderr = "";
 
-      proc.stdin.write(`${task}\n\n${item}`);
-      proc.stdin.end();
       proc.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
       proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
 
+      // Register close listener BEFORE writing to stdin
       proc.on("close", (code) => {
         clearTimeout(timeout);
         try {
@@ -708,6 +704,9 @@ app.post("/api/batch", async (req, res) => {
       });
 
       proc.on("error", (err) => { clearTimeout(timeout); reject(err); });
+
+      proc.stdin.write(`${task}\n\n${item}`);
+      proc.stdin.end();
     }))
   );
 
@@ -765,8 +764,9 @@ for streaming patterns.**
 
 **Extended thinking models** (e.g., haiku-4.5) work correctly with this
 approach. With `--include-partial-messages`, extended thinking models emit
-`content_block_delta` events for thinking content, but these have EMPTY
-`delta.text` — the `event.event?.delta?.text` check naturally skips them.
+`content_block_delta` events for thinking content, but these have no
+`delta.text` field (they carry `delta.thinking` instead) — the
+`event.event?.delta?.text` check returns `undefined` and naturally skips them.
 Real text tokens stream normally via `stream_event` for all models.
 The `assistant` event contains the full thinking block (for logging) followed
 by the text block — but since text was already streamed, only forward
@@ -863,6 +863,7 @@ async function streamTask(task) {
         const data = JSON.parse(line.slice(6));
         if (data.type === "token") output.textContent += data.text;
         else if (data.type === "done") { /* stream complete */ }
+        else if (data.type === "warning") output.textContent += `\n[Warning: ${data.message}]`;
         else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
       } catch { /* malformed SSE data — skip */ }
     }
@@ -962,6 +963,8 @@ all three are present:
      gotResult = true;
      if (event.is_error) {
        res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
+     } else if (event.subtype === "error_max_turns") {
+       res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
      } else {
        res.write(`data: ${JSON.stringify({ type: "done", data: event.structured_output })}\n\n`);
      }
