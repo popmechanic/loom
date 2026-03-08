@@ -16,7 +16,7 @@ to build applications where Claude is the runtime.
 9. [MCP Servers](#mcp-servers)
 10. [Hooks](#hooks)
 11. [Agent SDK (Programmatic)](#agent-sdk)
-12. [Cost and Safety Controls](#cost-and-safety)
+12. [Safety Controls](#cost-and-safety)
 13. [Quick Reference Table](#quick-reference)
 
 ---
