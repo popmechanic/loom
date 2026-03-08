@@ -298,9 +298,16 @@ for streaming patterns.**
   It's informational — no action needed unless `utilization` is consistently high,
   in which case add a small delay between concurrent spawns to avoid hitting limits.
 
-**Extended thinking models** (e.g., haiku) emit `thinking` blocks in
-`assistant` events before `text` blocks. These are internal reasoning and
-should not be forwarded to the frontend.
+**Extended thinking models** (e.g., haiku-4.5) work correctly with this
+approach. With `--include-partial-messages`, extended thinking models emit
+`content_block_delta` events for thinking content, but these have EMPTY
+`delta.text` — the `event.event?.delta?.text` check naturally skips them.
+Real text tokens stream normally via `stream_event` for all models.
+The `assistant` event contains the full thinking block (for logging) followed
+by the text block — but since text was already streamed, only forward
+`tool_use` from `assistant` events. Do NOT fall back to forwarding
+`assistant` text blocks — this is unnecessary with `--include-partial-messages`
+and would cause duplicate text.
 ```
 
 **Step 2: Update the "Extracting text and tool use" example**
@@ -535,33 +542,23 @@ After the "What to Generate" numbered list (after item 4 "A one-liner to run it"
 ```markdown
 ### First-Run Reliability Checklist
 
-Before showing the app to the user, verify these common failure points:
+These are the silent-failure modes — things that break with NO error message.
+The inline patterns above demonstrate correct handling for each, but they're
+easy to miss or deviate from when generating a new app.
 
-**Server:**
 - [ ] `--include-partial-messages` is on every streaming spawn — without it, text dumps as a single block instead of streaming token-by-token
-- [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise text appears twice
-- [ ] `express.json()` middleware is applied before any route that reads `req.body`
-- [ ] `cookieParser()` middleware is applied (required for session cookies)
-- [ ] `express.static("public")` serves the frontend (or CORS is configured for separate origins)
-- [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently inside Claude Code
-- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude can reason but can't act (silent failure, no error)
-- [ ] `--max-turns` is set on every spawn — without it, Claude can loop indefinitely
-- [ ] All `JSON.parse` calls are wrapped in try/catch — killed processes emit partial JSON
-- [ ] `is_error` is checked on result events before accessing `structured_output`
-- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false` so it's easy to miss
-- [ ] stderr is captured on every spawn (at minimum `console.error`)
-- [ ] The `gotResult` guard fires an error event if the process exits without a result
-- [ ] If frontend and server are on different ports, CORS is configured
-- [ ] `package.json` includes all dependencies: `express`, `cookie-parser`, `uuid` (and `cors` if needed)
-
-**Frontend:**
-- [ ] SSE buffer splits on `"\n\n"` and keeps the last incomplete chunk
-- [ ] `JSON.parse` on SSE data is wrapped in try/catch
-- [ ] 401 responses redirect to the OAuth setup screen (in-memory sessions are wiped on server restart)
-- [ ] The "done" handler does NOT reference `data.cost` (subscription users)
+- [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
+- [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently when the server runs inside Claude Code
+- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
+- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false`, so unchecked it looks like success
+- [ ] `express.json()` middleware is applied before any route that reads `req.body` — without it, `req.body` is `undefined` and the spawn gets an empty prompt
+- [ ] 401 responses in the frontend redirect to the setup screen — in-memory sessions are wiped on server restart, and a 401 fed to the SSE parser fails silently
 ```
 
-This checklist addresses the primary reliability problem: Claude generates apps that deviate from the patterns in ways that cause silent failures. The checklist makes failure modes explicit so Claude can self-verify. The `--include-partial-messages` check is listed first because it's the most impactful fix.
+This checklist covers only the failure modes that produce no error — the ones where
+the app appears to work but produces wrong or missing output. Patterns that fail
+loudly (missing stderr capture, no `gotResult` guard) are already obvious from the
+inline code and don't need a checklist entry.
 
 **Step 4: Align "What to Generate" list with demonstrated patterns**
 
@@ -665,7 +662,12 @@ Expected: At least 3 matches (streaming section, quick reference, gotchas).
 Run: `grep -rn "maxBudget\|max.budget" skills/loom/references/cli-runtime-reference.md`
 Expected: No matches.
 
-**Step 11: Commit if any cleanup needed**
+**Step 11: Verify extended thinking note is updated**
+
+Run: `grep -n "extended thinking" skills/loom/SKILL.md`
+Expected: The note should mention that `--include-partial-messages` makes `stream_event` work for ALL models including extended thinking, and that thinking deltas have empty text. Should NOT say to "handle both `assistant` text blocks and `stream_event` deltas" or to "fall back" to assistant text — that guidance is obsolete.
+
+**Step 12: Commit if any cleanup needed**
 
 ```bash
 cd /Users/marcusestes/Websites/loom/.worktrees/loom-skill-reliability
