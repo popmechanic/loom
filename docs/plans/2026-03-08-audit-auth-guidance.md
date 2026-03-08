@@ -110,6 +110,21 @@ To:
     ], { input: `${task}\n\n${content}`, encoding: "utf-8", timeout: 60000, env: spawnEnvForUser(req.userSession) });
 ```
 
+**1c-ii.** Also in the REST pattern's **"Don't do this"** block, update the env cleanup bullet:
+
+Old:
+```
+- Don't skip env cleanup — always use `cleanEnv()` before spawning.
+  Do NOT strip all `CLAUDE_*` vars; some are required for auth.
+```
+
+New:
+```
+- Don't skip env setup — always use `spawnEnvForUser()` before spawning.
+  This calls `cleanEnv()` internally (removing nesting guards) and injects
+  the user's OAuth token. Do NOT strip all `CLAUDE_*` vars.
+```
+
 **1d.** In the **SSE Streaming** pattern, change:
 
 Old:
@@ -457,25 +472,36 @@ New replacement:
 
 **Verification:** The section now describes the complete server-restart-to-recovery cycle, includes the code guard, and explains setup screen re-initialization. The ASCII diagram uses indented code block (4-space indent) to avoid nested code fence issues.
 
-### Task 5: Add auth-specific items to First-Run Reliability Checklist
+### Task 5: Update First-Run Reliability Checklist for auth
 
-**Why:** The existing checklist covers streaming and env issues but doesn't cover auth-specific silent failures. These are the failures that matter most for reliability of the Login with Anthropic feature.
+**Why:** The existing checklist has one item that says "`cleanEnv()` is called on every `spawn`/`execFileSync`" -- this now contradicts the patterns (which use `spawnEnvForUser()`). That item must be replaced, not just supplemented. Additionally, new auth-specific checklist items are needed.
 
 **Files:** `skills/loom/SKILL.md`
 
 **Changes:**
 
-In the **First-Run Reliability Checklist** section, after the existing list (last item is about "401 responses in the frontend redirect to the setup screen"), add:
+**5a.** Replace the existing `cleanEnv()` checklist item:
+
+Old:
+```
+- [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently when the server runs inside Claude Code
+```
+
+New:
+```
+- [ ] `spawnEnvForUser()` is called on every `spawn`/`execFileSync` — this removes nesting guards AND injects the user's OAuth token; bare `cleanEnv()` omits the token and causes silent auth failure
+```
+
+**5b.** After the existing list (last item is about "401 responses in the frontend redirect to the setup screen"), add these new items:
 
 ```markdown
-- [ ] `spawnEnvForUser()` (not bare `cleanEnv()`) is used on every spawn -- without the token, `claude -p` starts but can't reach Anthropic's API
 - [ ] `cookie-parser` middleware is applied before any route that reads `req.cookies` -- without it, `requireAuth` sees `undefined` and every request returns 401
 - [ ] Profile fetch happens in the `/api/oauth/exchange` handler after token exchange -- without it, the frontend shows "CONNECTED" instead of the user's email
 - [ ] `/api/health` does NOT use `requireAuth` -- it must return `{needsSetup: true}` for unauthenticated users, not 401
 - [ ] WebSocket upgrade validates the session cookie from `req.headers.cookie` -- Express middleware does not run on WebSocket handshakes
 ```
 
-**Verification:** Auth failures now have their own checklist items covering the five most common silent failure modes.
+**Verification:** The old contradictory `cleanEnv()` item is gone. The replacement and new items cover the auth-specific silent failure modes without internal contradictions.
 
 ### Task 6: Update the Shared Utilities intro count and cleanEnv description
 
@@ -521,3 +547,4 @@ New:
   - `env: spawnEnvForUser(` should appear at every spawn site
   - `requireAuth` should appear on every route handler that spawns Claude
   - `refreshSessionIfNeeded` should appear before every spawn call
+  - The string `cleanEnv()` should NOT appear in any "Don't do this" bullet or checklist item as the recommended function -- only `spawnEnvForUser()` should appear in those advisory positions
