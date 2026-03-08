@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Make apps generated from the loom skill work on the first try by fixing the actual reliability gaps: incomplete code patterns (missing middleware, missing error handling, missing CORS), inaccurate stream event documentation, dead code paths, and a "What to Generate" checklist that mentions things (cookie-parser, express.static) the patterns never demonstrate.
+**Goal:** Make apps generated from the loom skill work on the first try. The primary root cause is that the skill's streaming patterns do NOT use `--include-partial-messages`, so streaming apps dump text as a single block instead of token-by-token. Secondary causes: incomplete code patterns (missing middleware, missing error handling, missing CORS), inaccurate stream event documentation, dead code paths, and a "What to Generate" checklist that mentions dependencies the patterns never demonstrate.
 
-**Architecture:** Progressive disclosure — SKILL.md stays under 500 lines as a lean orchestration doc (design conversation, architecture, safety defaults, "What to Generate" checklist, reliability checklist). All code patterns move to `references/server-patterns-reference.md` where they are fixed for completeness. The existing "The Conversation" section is preserved — it teaches Claude HOW to approach design questions. Event documentation is corrected against verified facts. Cost/budget references are removed (subscription users only).
+**Architecture:** Progressive disclosure — SKILL.md stays under 500 lines as a lean orchestration doc (design conversation, architecture, safety defaults, "What to Generate" checklist, reliability checklist). All code patterns move to `references/server-patterns-reference.md` where they are fixed for completeness. "The Conversation" section is preserved — it teaches Claude HOW to approach design questions. Event documentation is corrected against verified facts from testing on 2026-03-08. Cost/budget references are removed (subscription users only).
 
 **Tech Stack:** Markdown (SKILL.md), TypeScript code examples, `claude -p` CLI
 
@@ -67,7 +67,7 @@ Replace the extracted code sections in SKILL.md with brief summaries and `refere
 
 **Step 1: Replace the "Building It" code-heavy sections**
 
-Remove lines ~245-1381 (everything from "#### Safety Defaults" through "HTTP Hooks") and replace with a compact summary that points to the reference:
+Remove lines ~245-1381 (everything from "#### Safety Defaults" subsection's "Shared Utilities" through "HTTP Hooks") and replace with a compact summary that points to the reference:
 
 ```markdown
 ### Server Patterns
@@ -105,9 +105,11 @@ Buffer SSE lines with `split("\n\n")` and keep the last incomplete chunk.
 See the patterns reference for complete frontend code.
 ```
 
+**IMPORTANT:** Keep the "Safety Defaults" text block that precedes "Shared Utilities" (lines ~215-244) — this is the narrative explanation of `dontAsk`, `--allowedTools`, and `--max-turns`. It belongs in SKILL.md as design guidance. Only the code patterns move to the reference.
+
 **Step 2: Trim the frontmatter description**
 
-Replace the current 6-line description with a shorter version. Keep the same trigger phrases but cut word count:
+Replace the current 6-line description with a shorter version per CSO best practices. Keep the same trigger phrases but cut word count:
 
 ```yaml
 ---
@@ -136,69 +138,142 @@ git commit -m "Restructure SKILL.md — move code patterns to reference file"
 
 ---
 
-### Task 3: Fix code patterns for reliability
+### Task 3: Fix the streaming bug — add `--include-partial-messages`
 
-Fix the actual bugs and reliability gaps in `server-patterns-reference.md`. These are the changes that directly affect whether generated apps work on the first try. This is the most important task in the plan.
+**THIS IS THE PRIMARY RELIABILITY FIX.** Without `--include-partial-messages`, text arrives ONLY as complete `assistant` blocks — no token-by-token streaming. The skill's SSE, WebSocket, Background Job, and Persistent Session patterns all produce apps where streaming text appears as a single dump instead of typing in progressively. This flag was verified on this machine (2026-03-08) as required for token streaming.
 
 **Files:**
 - Modify: `skills/loom/references/server-patterns-reference.md`
 
-**Step 1: Fix the SSE streaming pattern**
+**Step 1: Add `--include-partial-messages` to ALL streaming patterns**
 
-Make these changes to the SSE pattern:
+In every `spawn("claude", [...])` call that uses `--output-format stream-json`, add `"--include-partial-messages"` to the args array. This applies to:
 
-1. **Remove the `stream_event` branch** — text arrives as complete blocks in `assistant` events. The stream may contain additional event types beyond those documented; these can be safely ignored. Replace the `stream_event` branch with a comment:
-   ```typescript
-   // Note: text arrives as complete blocks in "assistant" events.
-   // The stream may contain additional event types — safe to ignore.
-   ```
+1. **SSE Streaming pattern** — the `spawn("claude", [...])` call
+2. **WebSocket Session pattern** — the `spawn("claude", [...])` call
+3. **Background Job pattern** — the `spawn("claude", [...])` call
+4. **Persistent Session pattern** — the `spawn("claude", [...])` call
 
-2. **Confirm `express.json()` is shown** — the SSE pattern's `app.post("/api/stream")` reads `req.body.task`. The pattern must show `app.use(express.json())` before the route. (The REST pattern shows it; the SSE pattern does not — it assumes they share the same app but never says so.) Add `app.use(express.json());` explicitly at the top of the SSE pattern's code block.
+Example change for the SSE pattern:
+```typescript
+  const proc = spawn("claude", [
+    "-p", "--output-format", "stream-json", "--verbose",
+    "--include-partial-messages",                          // <-- ADD THIS
+    "--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Bash",
+    "--max-turns", "15",
+    "--model", "sonnet", "--no-session-persistence",
+    task
+  ], { env: cleanEnv() });
+```
 
-3. **Add `subtype: "error_max_turns"` detection** to the result handler. Use `subtype` (verified to exist) and `is_error` (verified). Do NOT add `stop_reason` handling — the field exists but checking `subtype` is sufficient and clearer:
-   ```typescript
-   } else if (event.type === "result") {
-     gotResult = true;
-     if (event.is_error) {
-       res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
-     } else if (event.subtype === "error_max_turns") {
-       res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
-     } else {
-       res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-     }
-   }
-   ```
+**Step 2: Update the stream event handling comments**
 
-4. **Remove cost from the result event** — change `{ type: "done", cost: event.total_cost_usd }` to `{ type: "done" }`. Subscription users.
+Now that `--include-partial-messages` is used, the stream includes real `stream_event` tokens. Update the SSE pattern comment to reflect the verified event sequence:
 
-5. **Add `JSON.parse` error handling in the frontend** — the `data = JSON.parse(line.slice(6))` call throws if the SSE line is malformed (partial data, heartbeat corruption). Wrap in try/catch:
-   ```javascript
-   try {
-     const data = JSON.parse(line.slice(6));
-     if (data.type === "token") output.textContent += data.text;
-     else if (data.type === "done") { /* stream complete */ }
-     else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
-   } catch { /* malformed SSE data — skip */ }
-   ```
+```typescript
+  const parse = createStreamParser((event) => {
+    // With --include-partial-messages, tokens arrive as stream_event deltas.
+    // The assistant event contains the complete text after streaming finishes.
+    // Handle both for robustness.
+    if (event.type === "stream_event" && event.event?.delta?.text) {
+      res.write(`data: ${JSON.stringify({ type: "token", text: event.event.delta.text })}\n\n`);
+    } else if (event.type === "assistant" && event.message?.content) {
+      // Complete message block — useful for tool_use notifications.
+      // Text was already streamed via stream_event, so only forward tool_use.
+      for (const block of event.message.content) {
+        if (block.type === "tool_use") {
+          res.write(`data: ${JSON.stringify({ type: "tool", name: block.name })}\n\n`);
+        }
+      }
+    } else if (event.type === "result") {
+      gotResult = true;
+      if (event.is_error) {
+        res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
+      } else if (event.subtype === "error_max_turns") {
+        res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
+      } else {
+        res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+      }
+    }
+  });
+```
 
-6. **Remove cost display from the frontend** — change `else if (data.type === "done") document.getElementById("cost").textContent = ...` to `else if (data.type === "done") { /* stream complete */ }`.
+Apply the same event handling pattern to the WebSocket and Background Job patterns.
 
-**Step 2: Fix the WebSocket pattern**
+**Step 3: Update the "Don't do this" for SSE**
 
-1. Remove `let lineBuf = "";` (dead variable, never used — `createStreamParser` handles buffering).
-2. Remove the `stream_event` branch — same as SSE.
-3. Add `subtype: "error_max_turns"` detection to the result handler.
+Replace the bullet about `stream_event` vs `assistant`:
+```markdown
+- Don't omit `--include-partial-messages` — without it, text arrives as a
+  single complete block in `assistant` events instead of token-by-token
+  `stream_event` deltas. This makes streaming apps feel broken.
+```
 
-**Step 3: Fix the Background Job pattern**
+**Step 4: Commit**
 
-1. Remove `let lineBuf = "";` (dead variable, never used).
-2. Add `subtype: "error_max_turns"` detection to the result handler — set status to `"incomplete"` instead of `"complete"`.
+```bash
+cd /Users/marcusestes/Websites/loom/.worktrees/loom-skill-reliability
+git add skills/loom/references/server-patterns-reference.md
+git commit -m "Add --include-partial-messages to all streaming patterns (primary reliability fix)"
+```
 
-**Step 4: Fix the REST pattern — remove duplicate `cleanEnv()` call**
+---
 
-Remove `const env = cleanEnv();` (standalone line) — the inline `env: cleanEnv()` in `execFileSync` options already handles it.
+### Task 4: Fix remaining code patterns for reliability
 
-**Step 5: Fix the `extract()` function — stderr collection bug**
+Fix the actual bugs and reliability gaps in `server-patterns-reference.md`. These are the changes that directly affect whether generated apps work on the first try.
+
+**Files:**
+- Modify: `skills/loom/references/server-patterns-reference.md`
+
+**Step 1: Add Server Setup block**
+
+After the shared utilities section, before the first pattern, add a "Server Setup" block showing the boilerplate that all patterns share:
+
+```typescript
+import express from "express";
+import cookieParser from "cookie-parser";
+import path from "path";
+
+const app = express();
+app.use(express.json());
+app.use(cookieParser());
+app.use(express.static(path.join(__dirname, "public")));
+
+// If frontend and server run on different ports (e.g., Vite dev + Express API):
+// import cors from "cors";
+// app.use(cors({ origin: "http://localhost:5173" }));
+
+const PORT = process.env.PORT || 3456;
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+```
+
+This addresses the review finding that cookie-parser and express.static are mentioned in "What to Generate" but never demonstrated in patterns.
+
+**Step 2: Fix the REST pattern — remove duplicate `cleanEnv()` call**
+
+Remove `const env = cleanEnv();` (standalone line on ~line 327 of SKILL.md) — the inline `env: cleanEnv()` in `execFileSync` options already handles it.
+
+**Step 3: Add CORS note to the REST pattern**
+
+After the REST pattern's import block, add a comment:
+
+```typescript
+// If your frontend is served from a different origin (e.g., Vite dev server
+// on port 5173, API on port 3456), you need CORS headers:
+// import cors from "cors";
+// app.use(cors({ origin: "http://localhost:5173" }));
+//
+// For single-origin apps (express.static serves the frontend), CORS is not needed.
+```
+
+**Step 4: Remove `let lineBuf = ""` from WebSocket and Background Job patterns**
+
+These are dead variables — `createStreamParser` handles buffering internally. Remove:
+- WebSocket pattern: `let lineBuf = "";` (line ~520)
+- Background Job pattern: `let lineBuf = "";` (line ~597)
+
+**Step 5: Fix the `extract()` function — stderr collection deadlock**
 
 The current `extract()` collects stderr with `for await (const chunk of proc.stderr)` AFTER `for await (const chunk of proc.stdout)`, which deadlocks if stderr fills its buffer. Replace with concurrent collection:
 
@@ -238,56 +313,38 @@ async function extract<T>(prompt: string, schema: object, timeoutMs = 30000): Pr
 
 Changes: collect stderr concurrently via `.on("data")` instead of post-close `for await`; add `is_error` check; remove the fallback `return wrapper as T` which masked parse errors.
 
-**Step 6: Add CORS note to Express patterns**
+**Step 6: Remove cost from result event forwarding**
 
-After the REST pattern's import block, add a comment:
+In every pattern that forwards the result event to the frontend, change `{ type: "done", cost: event.total_cost_usd }` to `{ type: "done" }`. Subscription users don't need cost tracking. This applies to the SSE pattern (already fixed in Task 3) and the Error Surfacing Checklist example.
 
-```typescript
-// If your frontend is served from a different origin (e.g., Vite dev server
-// on port 5173, API on port 3456), you need CORS headers:
-// import cors from "cors";
-// app.use(cors({ origin: "http://localhost:5173" }));
-//
-// For single-origin apps (express.static serves the frontend), CORS is not needed.
+**Step 7: Add `JSON.parse` error handling in the frontend SSE code**
+
+The `data = JSON.parse(line.slice(6))` call throws if the SSE line is malformed (partial data, heartbeat corruption). Wrap in try/catch:
+
+```javascript
+try {
+  const data = JSON.parse(line.slice(6));
+  if (data.type === "token") output.textContent += data.text;
+  else if (data.type === "done") { /* stream complete */ }
+  else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
+} catch { /* malformed SSE data — skip */ }
 ```
 
-**Step 7: Add `express.static` setup to the patterns**
-
-After the shared utilities section, before the first pattern, add a "Server Setup" block showing the boilerplate that all patterns share:
-
-```typescript
-import express from "express";
-import cookieParser from "cookie-parser";
-import path from "path";
-
-const app = express();
-app.use(express.json());
-app.use(cookieParser());
-app.use(express.static(path.join(__dirname, "public")));
-
-// If frontend and server run on different ports (e.g., Vite dev + Express API):
-// import cors from "cors";
-// app.use(cors({ origin: "http://localhost:5173" }));
-
-const PORT = process.env.PORT || 3456;
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
-```
-
-This addresses the review finding that cookie-parser and express.static are mentioned in "What to Generate" but never demonstrated in patterns.
+Also remove the cost display from the frontend: change `else if (data.type === "done") document.getElementById("cost").textContent = ...` to `else if (data.type === "done") { /* stream complete */ }`.
 
 **Step 8: Commit**
 
 ```bash
 cd /Users/marcusestes/Websites/loom/.worktrees/loom-skill-reliability
 git add skills/loom/references/server-patterns-reference.md
-git commit -m "Fix code patterns — remove dead code, fix stderr bug, add CORS/static/middleware"
+git commit -m "Fix code patterns — remove dead code, fix stderr deadlock, add middleware, remove cost"
 ```
 
 ---
 
-### Task 4: Fix stream event documentation
+### Task 5: Fix stream event documentation
 
-The event types table documents event types that don't exist in `claude -p` output and misses ones that do. Correct it against verified facts.
+The event types table documents event types that don't match verified `claude -p` output and misses ones that do. Correct against verified facts from 2026-03-08 testing.
 
 **Files:**
 - Modify: `skills/loom/references/server-patterns-reference.md` — Stream-JSON Event Types section
@@ -300,19 +357,30 @@ Replace the existing table and surrounding text with:
 ```markdown
 #### Stream-JSON Event Types
 
-When using `--output-format stream-json --verbose`, Claude emits these event
-types as newline-delimited JSON:
+When using `--output-format stream-json --verbose`, Claude emits newline-delimited
+JSON events. With `--include-partial-messages`, the full event sequence is:
+
+```
+system (init) → stream_event (message_start) → stream_event (content_block_start)
+→ stream_event (content_block_delta) ×N → stream_event (content_block_stop)
+→ assistant (complete block) → stream_event (message_delta) → stream_event (message_stop)
+→ result
+```
+
+Without `--include-partial-messages`, only `system`, `assistant`, and `result`
+events appear — no token-level streaming. **Always use `--include-partial-messages`
+for streaming patterns.**
 
 | Event Type | Shape | What It Means | Forward? |
 |------------|-------|---------------|----------|
 | `system` | `{type:"system", subtype:"init", session_id, model, tools, ...}` | Session started | Optional (extract session_id) |
-| `assistant` | `{type:"assistant", message:{content:[{type:"text",text:"..."}, {type:"tool_use",...}]}}` | Complete message with text and/or tool calls | Yes (primary text delivery) |
-| `user` | `{type:"user", message:{content:[{type:"tool_result",...}]}}` | Tool result (auto-generated) | Optional (show tool output) |
-| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error, session_id, num_turns, usage}` | Session complete | Yes (done signal) |
+| `stream_event` | `{type:"stream_event", event:{type:"content_block_delta", delta:{text:"..."}}}` | Incremental token (requires `--include-partial-messages`) | Yes (live text) |
+| `assistant` | `{type:"assistant", message:{content:[{type:"text",text:"..."}, {type:"tool_use",...}]}}` | Complete message with text and/or tool calls | Tool use only (text already streamed) |
+| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error, session_id, num_turns, duration_ms}` | Session complete | Yes (done signal) |
 
-The stream may contain additional event types not listed here (internal
-events, rate limit signals, etc.). These can be safely ignored — only the
-four types above are needed for app development.
+The stream may contain additional event types not listed here (`rate_limit_event`,
+internal lifecycle events). These can be safely ignored — only the four types
+above are needed for app development.
 
 **Extended thinking models** (e.g., haiku) emit `thinking` blocks in
 `assistant` events before `text` blocks. These are internal reasoning and
@@ -326,7 +394,7 @@ After the event types table, add:
 ```markdown
 **Detecting max-turns exhaustion:** When `--max-turns` is exceeded, the `result`
 event has `subtype: "error_max_turns"` and `is_error: false`. Check `subtype`
-to detect this:
+to detect this — it's easy to miss because `is_error` is false:
 
 ```typescript
 if (event.type === "result") {
@@ -352,26 +420,29 @@ Replace the event sequence example (lines ~96-101) with:
 {"type":"result","subtype":"success","is_error":false,"session_id":"...","num_turns":1}
 ```
 
-Remove the `stream_event` line from the example — it does not appear in actual output.
+Note: With `--include-partial-messages`, additional `stream_event` events appear
+between `system` and `assistant` containing token-level deltas. See
+`references/server-patterns-reference.md` for the complete event sequence.
+
+Remove the `stream_event` line from the example — it is misleading without the
+`--include-partial-messages` flag context.
 
 **Step 4: Remove `total_cost_usd` jq example from cli-runtime-reference.md**
 
-Remove the line `claude -p --output-format json "query" | jq '.total_cost_usd'` from the json output section (line ~87). The field exists in the output but is not useful for subscription users and was a source of confusion.
+Remove the line `claude -p --output-format json "query" | jq '.total_cost_usd'` from the json output section (line ~87). The field exists in the output but is not useful for subscription users. Keep `total_cost_usd` listed in the `result` event shape documentation (line ~81) — it's accurate — but don't promote extracting it.
 
-Keep `total_cost_usd` listed in the `result` event shape documentation — it's accurate — but don't promote it as something to extract.
+**Step 5: Update the Node.js stream parsing example in cli-runtime-reference.md**
 
-**Step 5: Update the streaming section Node.js example in cli-runtime-reference.md**
-
-The Node.js stream parsing example (lines ~258-265) uses `event.type === 'stream_event'` with `event.event?.delta?.text`. This accessor does work for extracting text when present. Update the example to handle the primary `assistant` event type and add a note about additional events:
+The Node.js stream parsing example (lines ~258-265) uses `event.type === 'stream_event'` with `event.event?.delta?.text`. This works only with `--include-partial-messages`. Update the example to handle both token deltas and complete assistant blocks, and add a note about the flag:
 
 ```javascript
+// Note: stream_event tokens require --include-partial-messages flag.
+// Without it, text arrives only in assistant events.
 const readline = require('readline');
 for await (const line of readline.createInterface({ input: process.stdin })) {
   const event = JSON.parse(line);
-  if (event.type === 'assistant' && event.message?.content) {
-    for (const block of event.message.content) {
-      if (block.type === 'text') process.stdout.write(block.text);
-    }
+  if (event.type === 'stream_event' && event.event?.delta?.text) {
+    process.stdout.write(event.event.delta.text);
   }
   // The stream may contain additional event types — safe to ignore.
 }
@@ -387,18 +458,37 @@ git commit -m "Fix event documentation against verified stream-json facts"
 
 ---
 
-### Task 5: Fix cli-runtime-reference.md — add missing flags, remove cost guidance
+### Task 6: Fix cli-runtime-reference.md — add missing flags, remove cost guidance
 
 **Files:**
 - Modify: `skills/loom/references/cli-runtime-reference.md`
 
-**Step 1: Remove `maxBudgetUsd` from the Agent SDK TypeScript example**
+**Step 1: Add `--include-partial-messages` to the streaming section**
 
-In the TypeScript SDK example (line ~380), remove the line `    maxBudgetUsd: 10.00,` from the options object. This flag controls API dollar spend and has no meaningful effect for subscription users. The skill targets subscription users exclusively.
+After the output streaming bash example (line ~255), add:
 
-**Step 2: Reframe model selection comment**
+```markdown
+### Token-level streaming (--include-partial-messages)
 
-In the Safety Controls section (line ~409-410), change `# Model selection for cost` to `# Model selection` and reframe the comments as speed/quality rather than cost:
+By default, `--output-format stream-json` delivers text only as complete
+`assistant` blocks. To get token-by-token `stream_event` deltas, add
+`--include-partial-messages`:
+
+```bash
+claude -p --output-format stream-json --verbose --include-partial-messages "Write a story"
+```
+
+Without this flag, streaming apps show text as a single dump instead of
+typing progressively. **Required for SSE/WebSocket streaming patterns.**
+```
+
+**Step 2: Remove `maxBudgetUsd` from the Agent SDK TypeScript example**
+
+In the TypeScript SDK example (line ~380), remove the line `    maxBudgetUsd: 10.00,` from the options object. This flag controls API dollar spend and has no meaningful effect for subscription users.
+
+**Step 3: Reframe model selection comment**
+
+In the Safety Controls section (lines ~409-410), change `# Model selection for cost` to `# Model selection` and reframe as speed/quality:
 
 ```bash
 # Model selection
@@ -407,7 +497,7 @@ claude -p --model sonnet "standard task"       # Balanced
 claude -p --model opus "complex reasoning"     # Best quality
 ```
 
-**Step 3: Add `--effort` to the Safety Controls section**
+**Step 4: Add `--effort` to the Safety Controls section**
 
 After the model selection block, add:
 
@@ -417,7 +507,7 @@ claude -p --effort high "complex analysis task"   # Maximum reasoning
 claude -p --effort low "simple extraction"          # Fast, less reasoning
 ```
 
-**Step 4: Add `--add-dir` to the Tool Configuration section**
+**Step 5: Add `--add-dir` to the Tool Configuration section**
 
 After the fine-grained allow/deny examples, add:
 
@@ -426,42 +516,65 @@ After the fine-grained allow/deny examples, add:
 claude -p --add-dir /data/shared --add-dir /tmp/uploads "analyze files"
 ```
 
-**Step 5: Add missing flags to the Quick Reference table**
+**Step 6: Add missing flags to the Quick Reference table**
 
 Add these rows to the Quick Reference table:
 
 ```markdown
+| Token streaming | `claude -p --output-format stream-json --verbose --include-partial-messages "query"` |
 | Effort control | `claude -p --effort high "query"` |
 | Extra directories | `claude -p --add-dir /path "query"` |
 ```
 
-Do NOT add `--max-budget-usd`. It controls API dollar spend and is meaningless for subscription users. If someone needs it, it's in `claude --help`.
+Do NOT add `--max-budget-usd`. It controls API dollar spend and is meaningless for subscription users.
 
-**Step 6: Commit**
+**Step 7: Reframe the "Fast/cheap" row in Quick Reference**
+
+Change:
+```markdown
+| Fast/cheap | `claude -p --model haiku "query"` |
+```
+to:
+```markdown
+| Fast model | `claude -p --model haiku "query"` |
+```
+
+**Step 8: Document `dontAsk` + empty result behavior**
+
+In the Gotchas section, update item 7 to be more prominent about the silent failure:
+
+```markdown
+7. **`dontAsk` without `--allowedTools`** = silent failure. `dontAsk` auto-denies everything not explicitly allowed. Without `--allowedTools`, Claude has NO tools — it can reason but can't act. The result is an empty or incomplete response with NO error. Always pair `--permission-mode dontAsk` with `--allowedTools "Read,Bash,..."` or `--tools "Read,Bash,..."`.
+```
+
+**Step 9: Add `--include-partial-messages` to Gotchas**
+
+Add a new gotcha:
+
+```markdown
+11. **`--include-partial-messages` required for token streaming** — Without this flag, `stream-json` output delivers text only as complete `assistant` blocks (no `stream_event` tokens). Add `--include-partial-messages` to get token-by-token deltas for SSE/WebSocket streaming.
+```
+
+**Step 10: Commit**
 
 ```bash
 cd /Users/marcusestes/Websites/loom/.worktrees/loom-skill-reliability
 git add skills/loom/references/cli-runtime-reference.md
-git commit -m "Add missing CLI flags, remove subscription-irrelevant cost guidance"
+git commit -m "Add --include-partial-messages flag, --effort, --add-dir; remove cost guidance"
 ```
 
 ---
 
-### Task 6: Fix remaining cost references and add reliability checklist to SKILL.md
+### Task 7: Add reliability checklist and fix "What to Generate" in SKILL.md
 
 **Files:**
 - Modify: `skills/loom/SKILL.md`
 
-**Step 1: Fix "Safety Defaults" line**
+**Step 1: Fix "Safety Defaults" cost reference**
 
 If the text "no human sitting at a terminal to approve tool use or notice runaway costs" survived the restructuring, change it to "no human sitting at a terminal to approve tool use".
 
-**Step 2: Verify no remaining cost references**
-
-Run: `grep -n "cost\|total_cost_usd\|budget\|billing" skills/loom/SKILL.md`
-Expected: No matches.
-
-**Step 3: Add a first-run reliability checklist to the "What to Generate" section**
+**Step 2: Add first-run reliability checklist**
 
 After the "What to Generate" numbered list (after item 4 "A one-liner to run it"), add:
 
@@ -471,11 +584,12 @@ After the "What to Generate" numbered list (after item 4 "A one-liner to run it"
 Before showing the app to the user, verify these common failure points:
 
 **Server:**
+- [ ] `--include-partial-messages` is on every streaming spawn — without it, text dumps as a single block instead of streaming token-by-token
 - [ ] `express.json()` middleware is applied before any route that reads `req.body`
 - [ ] `cookieParser()` middleware is applied (required for session cookies)
 - [ ] `express.static("public")` serves the frontend (or CORS is configured for separate origins)
 - [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently inside Claude Code
-- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude can reason but can't act (silent failure)
+- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude can reason but can't act (silent failure, no error)
 - [ ] `--max-turns` is set on every spawn — without it, Claude can loop indefinitely
 - [ ] All `JSON.parse` calls are wrapped in try/catch — killed processes emit partial JSON
 - [ ] `is_error` is checked on result events before accessing `structured_output`
@@ -492,11 +606,11 @@ Before showing the app to the user, verify these common failure points:
 - [ ] The "done" handler does NOT reference `data.cost` (subscription users)
 ```
 
-This checklist addresses the primary reliability problem: Claude generates apps that deviate from the patterns in ways that cause silent failures. The checklist makes failure modes explicit so Claude can self-verify.
+This checklist addresses the primary reliability problem: Claude generates apps that deviate from the patterns in ways that cause silent failures. The checklist makes failure modes explicit so Claude can self-verify. The `--include-partial-messages` check is listed first because it's the most impactful fix.
 
-**Step 4: Align "What to Generate" list with demonstrated patterns**
+**Step 3: Align "What to Generate" list with demonstrated patterns**
 
-Update the "What to Generate" list to match what's actually shown in the patterns. The current list mentions `cookie-parser` without showing the import. Fix item 1 to reference the Server Setup block in the patterns reference:
+Update item 1 to reference the Server Setup block:
 
 Change item 1 from:
 ```
@@ -525,63 +639,73 @@ to:
    and `cors` if frontend/server are separate origins) and a start script
 ```
 
+**Step 4: Remove any remaining cost/budget references**
+
+Run: `grep -n "cost\|total_cost_usd\|budget\|billing" skills/loom/SKILL.md`
+Expected: No matches. Fix any that remain.
+
 **Step 5: Commit**
 
 ```bash
 cd /Users/marcusestes/Websites/loom/.worktrees/loom-skill-reliability
 git add skills/loom/SKILL.md
-git commit -m "Add reliability checklist and align What to Generate with demonstrated patterns"
+git commit -m "Add reliability checklist, align What to Generate with demonstrated patterns"
 ```
 
 ---
 
-### Task 7: Final verification pass
+### Task 8: Final verification pass
 
 **Step 1: Verify SKILL.md line count**
 
 Run: `wc -l skills/loom/SKILL.md`
 Expected: Under 500 lines.
 
-**Step 2: Verify no broken cross-references**
+**Step 2: Verify `--include-partial-messages` is in all streaming spawns**
 
-Run: `grep -n "stream_event\|content_block_start\|content_block_stop\|lineBuf\|total_cost_usd" skills/loom/SKILL.md`
-Expected: No matches (these have all been moved to the patterns reference or removed).
+Run: `grep -n "stream-json" skills/loom/references/server-patterns-reference.md`
+Every match should have `--include-partial-messages` in the same spawn args array (check surrounding lines).
 
-Run: `grep -n "stream_event" skills/loom/references/server-patterns-reference.md`
-Expected: Only in comments explaining why it's absent (not in code that tries to handle it).
+Run: `grep -c "include-partial-messages" skills/loom/references/server-patterns-reference.md`
+Expected: At least 4 matches (SSE, WebSocket, Background Job, Persistent Session).
 
-**Step 3: Verify no orphaned cost references**
+**Step 3: Verify no broken cross-references**
+
+Run: `grep -n "lineBuf" skills/loom/references/server-patterns-reference.md`
+Expected: No matches (dead variable removed).
+
+Run: `grep -n "total_cost_usd" skills/loom/references/server-patterns-reference.md`
+Expected: Only in the result event shape documentation, not in code that forwards it to the frontend.
+
+**Step 4: Verify no orphaned cost references in SKILL.md**
 
 Run: `grep -rn "cost\|billing\|budget" skills/loom/SKILL.md`
 Expected: No matches.
 
-Run: `grep -n "total_cost_usd" skills/loom/references/server-patterns-reference.md`
-Expected: Only in the result event shape documentation (it's accurate), not in code examples that forward it to the frontend.
-
-Run: `grep -n "max.budget\|maxBudget" skills/loom/references/cli-runtime-reference.md`
-Expected: No matches.
-
-**Step 4: Verify the patterns reference has correct event handling**
-
-Scan all result-event handlers in the patterns reference:
-
-Run: `grep -n "stop_reason.*max_turns\|max_turns.*stop_reason" skills/loom/references/server-patterns-reference.md`
-Expected: No matches. (Max-turns is detected via `subtype`, not `stop_reason`.)
+**Step 5: Verify event handling is correct**
 
 Run: `grep -n "event.total_cost_usd\|cost:" skills/loom/references/server-patterns-reference.md`
 Expected: No matches in code that forwards data to the frontend.
 
-**Step 5: Verify cookie-parser and express.static are demonstrated**
+Run: `grep -n "error_max_turns" skills/loom/references/server-patterns-reference.md`
+Expected: At least 3 matches (SSE, WebSocket, Background Job result handlers + documentation).
+
+**Step 6: Verify cookie-parser and express.static are demonstrated**
 
 Run: `grep -n "cookieParser\|cookie-parser\|express.static" skills/loom/references/server-patterns-reference.md`
 Expected: At least one match each in the Server Setup block.
 
-**Step 6: Verify package.json dependencies are listed**
+**Step 7: Verify `--include-partial-messages` is in cli-runtime-reference.md**
 
-Run: `grep -n "cookie-parser" skills/loom/SKILL.md`
-Expected: At least one match in the "What to Generate" section and/or reliability checklist.
+Run: `grep -n "include-partial-messages" skills/loom/references/cli-runtime-reference.md`
+Expected: At least 3 matches (streaming section, quick reference, gotchas).
 
-**Step 7: Commit if any cleanup needed**
+**Step 8: Verify no `maxBudgetUsd` or `max-budget-usd` remain**
+
+Run: `grep -rn "maxBudget\|max.budget" skills/loom/references/cli-runtime-reference.md`
+Expected: No matches.
+
+**Step 9: Commit if any cleanup needed**
 
 ```bash
 cd /Users/marcusestes/Websites/loom/.worktrees/loom-skill-reliability
