@@ -2,22 +2,148 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Restructure the loom skill for reliability — fix code bugs, remove API-billing assumptions, compress to reference-delegated architecture, and correct documentation inaccuracies that cause first-run failures.
+**Goal:** Restructure the loom skill so apps generated from it work on the first try — fix the actual reliability problems (wrong event shapes, dead code paths, missing middleware/error handling), restructure via progressive disclosure to stay under the 500-line SKILL.md guideline, and correct documentation against verified `claude -p` output.
 
-**Architecture:** Split the monolithic 7,111-word SKILL.md into a lean orchestration document (~1,500 words) that delegates details to reference files. Fix all code examples for correctness. Remove subscription-irrelevant cost tracking. Add missing CLI flags and stream event types.
+**Architecture:** The current 1,438-line SKILL.md becomes a ~400-line orchestration document covering design conversation, architecture, safety defaults, and the "What to Generate" checklist. All code patterns (REST, SSE, WebSocket, Background Job, Parallel, Advanced) move to a new `references/server-patterns-reference.md`. The event types table and all stream-json documentation are corrected against verified `claude -p` output. The narrative/design conversation sections are preserved — they serve an important skill-design purpose (setting degrees of freedom for how Claude approaches design questions).
 
 **Tech Stack:** Markdown (SKILL.md), TypeScript code examples, `claude -p` CLI
 
 ---
 
-### Task 1: Fix the SKILL.md frontmatter description
+### Task 1: Verify actual `claude -p` stream-json event shapes
 
-The description field is 6 lines long and contains trigger phrases, workflow summaries, and negative matches. CSO best practices say the description should be 1-2 concise sentences that help Claude decide when to activate the skill — not a mini-essay.
+Before changing any documentation, capture ground truth from `claude -p --output-format stream-json --verbose`. This task produces a verified reference that all subsequent tasks use.
 
 **Files:**
-- Modify: `skills/loom/SKILL.md:1-14`
+- No files modified — this is a verification-only task
 
-**Step 1: Replace the frontmatter**
+**Step 1: Run a simple no-tools query**
+
+```bash
+echo "Say hello" | claude -p --output-format stream-json --verbose --tools "" --no-session-persistence --max-turns 1 2>/dev/null > /tmp/loom-verify-events.txt
+```
+
+**Step 2: Run a tool-using query that hits max-turns**
+
+```bash
+echo "List every file recursively and analyze each one" | claude -p --output-format stream-json --verbose --no-session-persistence --max-turns 1 --permission-mode bypassPermissions --model haiku 2>/dev/null > /tmp/loom-verify-maxturns.txt
+```
+
+**Step 3: Document verified event shapes**
+
+From the test output, confirm these facts (all verified during plan writing):
+
+1. **No `stream_event` tokens are emitted** — text arrives as complete blocks in `assistant` events. The `stream_event` code path in current examples is dead code.
+2. **No `content_block_start` or `content_block_stop` events** exist in `claude -p` output.
+3. **No separate `tool_result` event type** — tool results arrive as `user` events with `tool_use_result` field.
+4. **`result` event shape**: `{type:"result", subtype:"success"|"error_max_turns", stop_reason:"end_turn"|"tool_use", is_error:boolean, total_cost_usd:number, session_id, usage, num_turns}`.
+5. **Max-turns detection**: When `--max-turns` is exceeded, `subtype` is `"error_max_turns"`, `is_error` is `false`, `stop_reason` is `"tool_use"` (not `"max_turns"`).
+6. **`rate_limit_event`** exists but is internal — not useful to forward.
+7. **`system` event subtypes include**: `init`, `hook_started`, `hook_response`.
+
+These facts override any assumptions in the skill. If re-verification shows different results, update the plan accordingly.
+
+**Step 4: No commit needed — this is input for subsequent tasks**
+
+---
+
+### Task 2: Create `references/server-patterns-reference.md` with all code patterns
+
+Move the code-heavy sections out of SKILL.md into a dedicated reference file. This is the structural fix that brings SKILL.md under the 500-line guideline.
+
+**Files:**
+- Create: `skills/loom/references/server-patterns-reference.md`
+
+**Step 1: Create the reference file**
+
+Extract these sections from SKILL.md into the new file, preserving their content exactly (we fix bugs in later tasks):
+
+1. **Shared Utilities** — `cleanEnv()` and `createStreamParser()` (SKILL.md lines ~245-308)
+2. **Pattern: REST Endpoint** — including "Don't do this" (lines ~313-373)
+3. **Pattern: SSE Streaming** — including "Don't do this" (lines ~375-474)
+4. **Pattern: WebSocket Session** — including "Don't do this" (lines ~476-572)
+5. **Pattern: Background Job** — including "Don't do this" (lines ~574-632)
+6. **Pattern: Parallel Analysis** (lines ~634-684)
+7. **Stream-JSON Event Types** — table and assistant event extraction (lines ~686-735)
+8. **Frontend Layer** — streaming text display, structured result rendering (lines ~737-812)
+9. **Error Handling** — mental model and checklist (lines ~815-882)
+10. **Input Validation** (lines ~884-907)
+11. **Temp Directory Cleanup** (lines ~909-931)
+12. **Handling File Uploads and Drops** (lines ~932-1016)
+13. **Advanced Patterns** — extract, persistent session, action markers (lines ~1018-1161)
+14. **HTTP Hooks** (lines ~1162-1381)
+
+The reference file should begin with:
+
+```markdown
+# Loom Server Patterns Reference
+
+Complete code patterns for building Loom apps. Read `SKILL.md` for design
+guidance and architecture decisions before reaching for these patterns.
+
+Read `cli-runtime-reference.md` for the full `claude -p` flag reference.
+Read `oauth-reference.md` for authentication setup.
+```
+
+**Step 2: Commit**
+
+```bash
+git add skills/loom/references/server-patterns-reference.md
+git commit -m "Create server-patterns-reference.md from SKILL.md code sections"
+```
+
+---
+
+### Task 3: Slim SKILL.md to orchestration document
+
+Replace the extracted code sections in SKILL.md with brief summaries and `references/` pointers. Preserve all non-code sections: frontmatter, intro, "Why This Matters", "The Conversation" (design questions), "The Possibility Space", architecture diagram, communication patterns table, model/performance table, "What to Generate", and deployment verification.
+
+**Files:**
+- Modify: `skills/loom/SKILL.md`
+
+**Step 1: Replace the "Building It" code-heavy sections**
+
+Remove lines ~245-1381 (everything from "#### Safety Defaults" through "HTTP Hooks") and replace with a compact summary that points to the reference:
+
+```markdown
+### Server Patterns
+
+The server spawns `claude -p` processes and bridges results to the frontend.
+For complete, copy-pasteable patterns with "Don't do this" guards, see
+`references/server-patterns-reference.md`. Here's the mental model:
+
+**Safety Defaults (non-negotiable for every pattern):**
+- `--permission-mode dontAsk` — prevents Claude from hanging on approval prompts
+- `--allowedTools "Read,Bash,..."` — required with `dontAsk` or Claude has no tools
+- `--max-turns N` — prevents infinite loops (5 for one-shot, 10-15 for streaming)
+
+**Shared Utilities:** `cleanEnv()` strips nesting-detection env vars so `claude -p`
+can start when your server runs inside Claude Code. `createStreamParser()` buffers
+chunked stdout into complete JSON lines. Both are defined in the patterns reference.
+
+**Choose your pattern:**
+
+| Pattern | When | Reference Section |
+|---------|------|-------------------|
+| REST + JSON | One-shot, structured output | "Pattern: REST Endpoint" |
+| SSE Streaming | Live text to browser | "Pattern: SSE Streaming" |
+| WebSocket | Bidirectional, multi-turn | "Pattern: WebSocket Session" |
+| Background Job | Long-running with polling | "Pattern: Background Job" |
+| Parallel Analysis | Batch concurrent items | "Pattern: Parallel Analysis" |
+| HTTP Hooks | Tool lifecycle, browser-based permission approval | "HTTP Hooks" |
+
+**Error handling:** Every pattern handles three failure modes — stderr capture,
+non-zero exit code detection, and `is_error` checks on the result event. See
+the Error Surfacing Checklist in the patterns reference.
+
+**Frontend:** Use `fetch()` + `ReadableStream` for POST-based SSE (CSRF-safe).
+Buffer SSE lines with `split("\n\n")` and keep the last incomplete chunk.
+See the patterns reference for complete frontend code.
+```
+
+**Step 2: Trim the frontmatter description**
+
+Replace the current 6-line description with:
 
 ```yaml
 ---
@@ -28,196 +154,171 @@ description: >
 ---
 ```
 
-This is concise, accurate, and sufficient for skill matching. The trigger phrases and negative conditions ("NOT for Anthropic API apps") belong in the body, not the description.
+**Step 3: Verify line count**
 
-**Step 2: Verify the file parses correctly**
-
-Run: `head -6 skills/loom/SKILL.md`
-Expected: The new frontmatter, cleanly formatted.
-
-**Step 3: Commit**
-
-```bash
-git add skills/loom/SKILL.md
-git commit -m "Trim loom skill description to 2-sentence summary"
-```
-
----
-
-### Task 2: Remove all API-billing / cost-tracking references
-
-The skill targets Claude Code subscription users, not API-billing users. References to `total_cost_usd`, cost display in the frontend, and cost-related fields in event tables add complexity and cause confusion. Remove them throughout.
-
-**Files:**
-- Modify: `skills/loom/SKILL.md` (multiple sections)
-- Modify: `skills/loom/references/cli-runtime-reference.md` (event table, JSON output fields)
-
-**Step 1: In SKILL.md, remove cost references from:**
-
-1. **SSE streaming pattern** (line ~424): Change the `result` event handler from:
-   ```typescript
-   res.write(`data: ${JSON.stringify({ type: "done", cost: event.total_cost_usd })}\n\n`);
-   ```
-   to:
-   ```typescript
-   res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-   ```
-
-2. **Frontend streaming display** (line ~776): Remove the cost display line:
-   ```javascript
-   else if (data.type === "done") document.getElementById("cost").textContent = `$${data.cost.toFixed(4)}`;
-   ```
-   Replace with:
-   ```javascript
-   else if (data.type === "done") { /* stream complete */ }
-   ```
-
-3. **Stream-JSON event types table** (line ~699): Remove `total_cost_usd` from the `result` event shape. Change:
-   ```
-   | `result` | `{type:"result", total_cost_usd, usage, is_error}` | Session complete | Yes (done + cost) |
-   ```
-   to:
-   ```
-   | `result` | `{type:"result", usage, is_error}` | Session complete | Yes (done signal) |
-   ```
-
-4. **Safety Defaults section** (line ~218): The section currently says "notice runaway costs" — remove the cost reference. Change "no human sitting at a terminal to approve tool use or notice runaway costs" to "no human sitting at a terminal to approve tool use".
-
-**Step 2: In cli-runtime-reference.md, remove cost references from:**
-
-1. **JSON output format** (line ~80-87): Remove `total_cost_usd` from the fields list and the jq example:
-   - Remove: `claude -p --output-format json "query" | jq '.total_cost_usd'`
-   - Remove `total_cost_usd` from the fields enumeration
-
-2. **stream-json event sequence** (line ~100): Remove `total_cost_usd` from the result event:
-   ```
-   {"type":"result","subtype":"success","total_cost_usd":0.02}
-   ```
-   becomes:
-   ```
-   {"type":"result","subtype":"success"}
-   ```
-
-3. **Safety Controls section** (line ~400-413): Remove `--max-budget-usd` reference from the Agent SDK TypeScript example if present.
-
-**Step 3: Verify no remaining cost references**
-
-Run: `grep -rn "cost\|total_cost_usd\|budget" skills/loom/`
-Expected: No matches (or only the `--max-budget-usd` CLI flag in the reference, which is fine to keep as a flag listing but shouldn't appear in code examples).
+Run: `wc -l skills/loom/SKILL.md`
+Expected: Under 500 lines (target: ~300-400).
 
 **Step 4: Commit**
 
 ```bash
-git add skills/loom/SKILL.md skills/loom/references/cli-runtime-reference.md
-git commit -m "Remove API-billing cost references — subscription users only"
+git add skills/loom/SKILL.md
+git commit -m "Restructure SKILL.md — move code patterns to reference file"
 ```
 
 ---
 
-### Task 3: Fix the stream event documentation
+### Task 4: Fix the stream event documentation against verified output
 
-The skill's stream event documentation has gaps that cause parsing failures:
-
-1. Missing `content_block_start` and `content_block_stop` events that wrap `content_block_delta`
-2. The `delta` structure is documented as `{text:"token"}` but is actually `{type:"text_delta", text:"token"}`
-3. The `assistant` event's content blocks can include `thinking` blocks (extended thinking models) — partially documented but the type isn't listed
+The event types table in the patterns reference (moved from SKILL.md in Task 2) documents event types that don't exist and misses ones that do. Fix it against the verified output from Task 1.
 
 **Files:**
-- Modify: `skills/loom/SKILL.md` — Stream-JSON Event Types table (~line 686-706)
-- Modify: `skills/loom/references/cli-runtime-reference.md` — Event sequence (~line 89-101)
+- Modify: `skills/loom/references/server-patterns-reference.md` — Stream-JSON Event Types section
+- Modify: `skills/loom/references/cli-runtime-reference.md` — Event sequence section
 
-**Step 1: Update the SKILL.md event types table**
-
-Replace the current table with:
+**Step 1: Replace the event types table in server-patterns-reference.md**
 
 ```markdown
+#### Stream-JSON Event Types
+
+When using `--output-format stream-json --verbose`, Claude emits these event
+types as newline-delimited JSON:
+
 | Event Type | Shape | What It Means | Forward? |
 |------------|-------|---------------|----------|
-| `system` | `{type:"system", subtype:"init", session_id, model}` | Session started | Optional (show model) |
-| `content_block_start` | `{type:"content_block_start", index, content_block:{type:"text"}}` | Text block beginning | No (internal) |
-| `stream_event` | `{type:"stream_event", event:{type:"content_block_delta", delta:{type:"text_delta", text:"..."}}}` | Incremental token | Yes (live text) |
-| `content_block_stop` | `{type:"content_block_stop", index}` | Text block finished | No (internal) |
-| `assistant` | `{type:"assistant", message:{content:[{type:"text",text:"..."}, {type:"tool_use",...}]}}` | Complete message block | Yes (text + tool progress) |
-| `tool_result` | `{type:"tool_result", tool_name, content, is_error}` | Tool completed | Optional (show result) |
-| `result` | `{type:"result", usage, is_error}` | Session complete | Yes (done signal) |
-| `compact` | `{type:"compact"}` | Context window compacted | No (internal) |
+| `system` | `{type:"system", subtype:"init", session_id, model, tools, ...}` | Session started | Optional (extract session_id) |
+| `assistant` | `{type:"assistant", message:{content:[{type:"text",text:"..."}, {type:"tool_use",...}]}}` | Complete message with text and/or tool calls | Yes (primary text delivery) |
+| `user` | `{type:"user", message:{content:[{type:"tool_result",...}]}, tool_use_result}` | Tool result (auto-generated) | Optional (show tool output) |
+| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error, stop_reason, session_id, num_turns, total_cost_usd, usage}` | Session complete | Yes (done signal) |
+
+**Events you will NOT see** (contrary to some documentation):
+- No `stream_event` with incremental token deltas — text arrives as complete
+  blocks in `assistant` events. The `stream_event` type is not emitted by
+  current `claude -p` versions.
+- No `content_block_start` or `content_block_stop` wrapper events.
+- No separate `tool_result` event type — tool results are inside `user` events.
+
+**Extended thinking models** (e.g., haiku) emit `thinking` blocks in
+`assistant` events before `text` blocks. These are internal reasoning and
+should not be forwarded to the frontend.
 ```
 
-**Step 2: Update the stream_event extraction in code examples**
+**Step 2: Add max-turns detection guidance**
 
-The code currently checks `event.event?.delta?.text` — this works because `delta.text` exists on the `text_delta` type. But the intermediate `event.event.type` check is missing. Add a comment noting the full path:
+After the event types table, add:
+
+```markdown
+**Detecting max-turns exhaustion:** When `--max-turns` is exceeded, the `result`
+event has `subtype: "error_max_turns"` and `is_error: false`. The `stop_reason`
+will be `"tool_use"` (not `"max_turns"`). Check `subtype` to detect this:
 
 ```typescript
-// stream_event wraps content_block_delta: event.event = {type:"content_block_delta", delta:{type:"text_delta", text:"..."}}
-// We extract text from the delta — the delta.type field ("text_delta") can be ignored for display
+if (event.type === "result") {
+  gotResult = true;
+  if (event.is_error) {
+    // Claude flagged the run as failed
+    send({ type: "error", message: event.result });
+  } else if (event.subtype === "error_max_turns") {
+    // Task ran out of turns — output may be incomplete
+    send({ type: "warning", message: "Task incomplete — reached turn limit" });
+  } else {
+    send({ type: "done" });
+  }
+}
 ```
-
-This is a documentation fix, not a code change — the existing `event.event?.delta?.text` accessor works correctly.
 
 **Step 3: Update cli-runtime-reference.md event sequence**
 
-Replace the event sequence example:
+Replace the event sequence example (lines ~96-101):
 
 ```
-{"type":"system","subtype":"init","session_id":"..."}
-{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"token"}}}
-{"type":"assistant","message":{...}}
-{"type":"result","subtype":"success"}
+{"type":"system","subtype":"init","session_id":"...","model":"claude-sonnet-4-6","tools":[...]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"...","num_turns":1,"total_cost_usd":0.003}
 ```
 
-**Step 4: Commit**
+Remove the `stream_event` line from the example — it does not appear in actual output.
+
+**Step 4: Remove `total_cost_usd` from the cli-runtime-reference.md jq example**
+
+Remove the line `claude -p --output-format json "query" | jq '.total_cost_usd'` from the json output section (line ~87). The field exists in the output but is not useful for subscription users and was a source of confusion.
+
+Keep `total_cost_usd` in the `result` event shape documentation — it's accurate — but don't promote it as something to extract.
+
+**Step 5: Commit**
 
 ```bash
-git add skills/loom/SKILL.md skills/loom/references/cli-runtime-reference.md
-git commit -m "Fix stream event types — add missing events and correct delta structure"
+git add skills/loom/references/server-patterns-reference.md skills/loom/references/cli-runtime-reference.md
+git commit -m "Fix event documentation against verified claude -p output"
 ```
 
 ---
 
-### Task 4: Fix the `cleanEnv()` function completeness
+### Task 5: Fix the code patterns for reliability
 
-The `cleanEnv()` function strips `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, and `CMUX_*` vars. But from the CLI help output, there are additional env vars that may trigger nesting detection. Verify and update.
-
-**Files:**
-- Modify: `skills/loom/SKILL.md` — cleanEnv function (~line 264-279)
-
-**Step 1: Verify current nesting detection variables**
-
-The current function handles:
-- `CLAUDECODE`
-- `CLAUDE_CODE_ENTRYPOINT`
-- `CMUX_SURFACE_ID`, `CMUX_PANEL_ID`, `CMUX_TAB_ID`, `CMUX_WORKSPACE_ID`, `CMUX_SOCKET_PATH`
-
-This is correct and complete based on current Claude Code behavior. The function explicitly preserves `CLAUDE_CODE_OAUTH_TOKEN` and other `CLAUDE_*` vars. No changes needed to the function itself.
-
-**Step 2: Add a clarifying comment about what NOT to strip**
-
-Add a comment after the function:
-
-```typescript
-// DO NOT strip: CLAUDE_CODE_OAUTH_TOKEN (auth), CLAUDE_MODEL (model override),
-// ANTHROPIC_API_KEY (API auth). Only strip nesting-detection vars.
-```
-
-**Step 3: Commit**
-
-```bash
-git add skills/loom/SKILL.md
-git commit -m "Add env var preservation comment to cleanEnv()"
-```
-
----
-
-### Task 5: Fix the `extract()` async helper bug
-
-The `extract()` function at ~line 1031-1061 has a bug: it tries to iterate `proc.stderr` with `for await` AFTER the process has closed (inside the `exitCode !== 0` branch). By that point, the stderr stream is already ended and the async iterator may not yield anything. The stderr should be collected concurrently.
+Fix the actual bugs and reliability gaps in the code patterns now in `server-patterns-reference.md`. These are the changes that directly affect whether generated apps work on the first try.
 
 **Files:**
-- Modify: `skills/loom/SKILL.md` — extract function (~line 1031-1061)
+- Modify: `skills/loom/references/server-patterns-reference.md`
 
-**Step 1: Fix the extract function**
+**Step 1: Fix the SSE streaming pattern — remove dead `stream_event` path, add missing middleware and error handling**
 
-Replace the function with:
+In the SSE pattern, make these changes:
+
+1. **Remove the `stream_event` branch** — it never fires. Replace with a comment:
+   ```typescript
+   // Note: text arrives as complete blocks in "assistant" events.
+   // There are no incremental "stream_event" token deltas in current claude -p output.
+   ```
+
+2. **Add `express.json()` middleware** — the `app.post("/api/stream")` handler reads `req.body.task` but the pattern doesn't show `app.use(express.json())`. Add it at the top of the pattern (it's shown in the REST pattern but not SSE).
+
+3. **Add `JSON.parse` error handling in the frontend** — the `data = JSON.parse(line.slice(6))` call throws if the SSE line is malformed (partial data, heartbeat corruption). Wrap in try/catch:
+   ```javascript
+   try {
+     const data = JSON.parse(line.slice(6));
+     if (data.type === "token") output.textContent += data.text;
+     else if (data.type === "done") { /* stream complete */ }
+     else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
+   } catch { /* malformed SSE data — skip */ }
+   ```
+
+4. **Add `subtype: "error_max_turns"` detection** to the result handler:
+   ```typescript
+   } else if (event.type === "result") {
+     gotResult = true;
+     if (event.is_error) {
+       res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
+     } else if (event.subtype === "error_max_turns") {
+       res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
+     } else {
+       res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+     }
+   }
+   ```
+
+5. **Remove cost from the result event** — change `{ type: "done", cost: event.total_cost_usd }` to `{ type: "done" }`.
+
+6. **Remove cost display from the frontend** — change `else if (data.type === "done") document.getElementById("cost").textContent = ...` to `else if (data.type === "done") { /* stream complete */ }`.
+
+**Step 2: Fix the WebSocket pattern — remove dead code**
+
+1. Remove `let lineBuf = "";` (dead variable, never used).
+2. Remove the `stream_event` branch — same as SSE.
+3. Add `subtype: "error_max_turns"` detection to the result handler.
+
+**Step 3: Fix the Background Job pattern — remove dead code**
+
+1. Remove `let lineBuf = "";` (dead variable, never used).
+2. Add `subtype: "error_max_turns"` detection.
+
+**Step 4: Fix the REST pattern — remove duplicate `cleanEnv()` call**
+
+Remove `const env = cleanEnv();` (line ~327 equivalent) — the inline `env: cleanEnv()` in `execFileSync` options already handles it.
+
+**Step 5: Fix the `extract()` function — stderr collection bug**
+
+Replace the `extract()` function with a version that collects stderr concurrently:
 
 ```typescript
 async function extract<T>(prompt: string, schema: object, timeoutMs = 30000): Promise<T> {
@@ -253,79 +354,33 @@ async function extract<T>(prompt: string, schema: object, timeoutMs = 30000): Pr
 }
 ```
 
-Changes:
-- Collect stderr concurrently via `.on("data")` instead of post-close `for await`
-- Collect stdout the same way for consistency
-- Add `is_error` check before accessing `structured_output`
-- Remove the fallback `return wrapper as T` which masked parse errors
+Changes: collect stderr concurrently via `.on("data")` instead of post-close `for await`; add `is_error` check; remove the fallback `return wrapper as T` which masked parse errors.
 
-**Step 2: Commit**
+**Step 6: Add CORS note to Express patterns**
+
+After the REST pattern's import block, add a note:
+
+```typescript
+// If your frontend is served from a different origin (e.g., Vite dev server
+// on port 5173, API on port 3456), you need CORS headers:
+// import cors from "cors";
+// app.use(cors({ origin: "http://localhost:5173" }));
+```
+
+This is one of the most common first-run failures: the frontend can't reach the API because CORS blocks it.
+
+**Step 7: Commit**
 
 ```bash
-git add skills/loom/SKILL.md
-git commit -m "Fix extract() stderr collection and add is_error check"
+git add skills/loom/references/server-patterns-reference.md
+git commit -m "Fix code patterns — remove dead stream_event paths, fix stderr bug, add CORS note"
 ```
 
 ---
 
-### Task 6: Fix the WebSocket pattern's unused `lineBuf` variable
+### Task 6: Add missing CLI flags to the reference
 
-The WebSocket pattern at ~line 520 declares `let lineBuf = ""` but never uses it — buffering is handled by `createStreamParser`. This dead variable is confusing.
-
-**Files:**
-- Modify: `skills/loom/SKILL.md` — WebSocket pattern (~line 520)
-
-**Step 1: Remove the dead variable**
-
-Delete the line `let lineBuf = "";` from the WebSocket pattern.
-
-**Step 2: Also remove unused `lineBuf` from Background Job pattern**
-
-The Background Job pattern at ~line 597 also has `let lineBuf = ""` that's unused. Remove it.
-
-**Step 3: Commit**
-
-```bash
-git add skills/loom/SKILL.md
-git commit -m "Remove dead lineBuf variables from code examples"
-```
-
----
-
-### Task 7: Fix the REST pattern's double `cleanEnv()` call
-
-The REST one-shot pattern at ~line 350 calls `cleanEnv()` twice — once to assign to `const env` and once inline in `execFileSync`. The `env` variable is never used.
-
-**Files:**
-- Modify: `skills/loom/SKILL.md` — REST pattern (~line 327-363)
-
-**Step 1: Remove the unused `env` variable**
-
-Remove `const env = cleanEnv();` (line ~327) since the inline `env: cleanEnv()` in the `execFileSync` options already handles it.
-
-**Step 2: Commit**
-
-```bash
-git add skills/loom/SKILL.md
-git commit -m "Remove duplicate cleanEnv() call in REST pattern"
-```
-
----
-
-### Task 8: Add missing CLI flags to the reference
-
-The cli-runtime-reference.md is missing several flags that exist in `claude --help`:
-
-- `--permission-prompt-tool` — not present but may not be relevant
-- `--max-budget-usd` — present in help, relevant for controlling spend
-- `--effort` — controls reasoning effort (low, medium, high)
-- `--add-dir` — additional directories for tool access
-- `--from-pr` — resume PR-linked sessions
-- `--allow-dangerously-skip-permissions` — distinct from `--dangerously-skip-permissions`
-- `--plugin-dir` — load plugins for session
-- `--settings` — load settings from file/JSON
-- `--setting-sources` — control which setting sources load
-- `auto` permission mode — missing from the permission modes table
+The cli-runtime-reference.md is missing flags that exist in `claude --help`.
 
 **Files:**
 - Modify: `skills/loom/references/cli-runtime-reference.md`
@@ -351,15 +406,7 @@ claude -p --effort low "simple extraction"          # Fast, less reasoning
 claude -p --add-dir /data/shared --add-dir /tmp/uploads "analyze files"
 ```
 
-**Step 4: Add `--max-budget-usd` to the Quick Reference table**
-
-```markdown
-| Budget limit | `claude -p --max-budget-usd 5.00 "query"` |
-```
-
-Note: Keep this in the reference as a CLI flag even though we removed cost-tracking code — it's a valid safety control for subscription users who want to limit per-invocation spend.
-
-**Step 5: Add missing flags to the Quick Reference table**
+**Step 4: Add missing flags to the Quick Reference table**
 
 ```markdown
 | Effort control | `claude -p --effort high "query"` |
@@ -367,166 +414,137 @@ Note: Keep this in the reference as a CLI flag even though we removed cost-track
 | Custom settings | `claude -p --settings ./settings.json "query"` |
 ```
 
-**Step 6: Commit**
+Do NOT add `--max-budget-usd` to the Quick Reference or code examples. This flag controls API dollar spend and has no meaningful effect for subscription users. The skill targets subscription users, so including it sends a mixed message. If someone needs it, it's in `claude --help`.
+
+**Step 5: Remove `maxBudgetUsd` from the Agent SDK TypeScript example**
+
+In the TypeScript SDK example (line ~380), remove `maxBudgetUsd: 10.00` from the options. Same reasoning: subscription users don't need this.
+
+**Step 6: Remove the cost-related jq example and cost-model comment**
+
+In the Safety Controls section (line ~409-410), remove or rewrite the comment `# Model selection for cost` — reframe as model selection for speed/quality:
+
+```bash
+# Model selection
+claude -p --model haiku "quick extraction"    # Fastest
+claude -p --model sonnet "standard task"       # Balanced
+claude -p --model opus "complex reasoning"     # Best quality
+```
+
+**Step 7: Commit**
 
 ```bash
 git add skills/loom/references/cli-runtime-reference.md
-git commit -m "Add missing CLI flags: --effort, --add-dir, --max-budget-usd, auto mode"
+git commit -m "Add missing CLI flags, remove subscription-irrelevant cost guidance"
 ```
 
 ---
 
-### Task 9: Compress the SKILL.md narrative sections
+### Task 7: Fix remaining cost references in SKILL.md
 
-The "Why This Matters", "The Conversation", and "The Possibility Space" sections are valuable for framing but consume ~1,500 words of the 7,111-word skill. These sections don't contain actionable patterns — they're philosophical guidance about what makes a Loom app different from a chat wrapper.
-
-Compress these three sections to ~400 words total while preserving their core insights.
+Remove the few cost references that remain in the slimmed SKILL.md after Task 3.
 
 **Files:**
 - Modify: `skills/loom/SKILL.md`
 
-**Step 1: Compress "Why This Matters"**
+**Step 1: Fix "Safety Defaults" line**
 
-Replace the current 3-paragraph section with:
+If the text "no human sitting at a terminal to approve tool use or notice runaway costs" survived the restructuring, change it to "no human sitting at a terminal to approve tool use".
 
-```markdown
-## Why This Matters
+**Step 2: Verify no remaining cost references**
 
-Claude Code is not a chat API — it's an agentic runtime with filesystem access,
-tool use, multi-turn sessions, structured output, and streaming. The question is:
-**what would you build if your backend could read files, run code, and stream its
-reasoning to the browser in real time?**
-```
+Run: `grep -n "cost\|total_cost_usd\|budget\|billing" skills/loom/SKILL.md`
+Expected: No matches.
 
-**Step 2: Compress "The Conversation"**
-
-Keep the design questions but remove the conversational framing ("Don't dump them all at once — have a natural conversation"). The questions themselves are the value. Remove the intro paragraph and the "Ask:" prompts. Keep the tables and bullet lists.
-
-**Step 3: Compress "The Possibility Space"**
-
-Replace with:
-
-```markdown
-## The Possibility Space
-
-The most interesting Loom apps aren't chat interfaces — they're things that
-couldn't exist without an agentic runtime. Help people think beyond "chat box
-in a browser" to "what would this look like if there were an intelligence behind it?"
-```
-
-**Step 4: Verify word count improvement**
-
-Run: `wc -w skills/loom/SKILL.md`
-Expected: Significant reduction from 7,111 words (target: ~5,500-6,000).
-
-**Step 5: Commit**
+**Step 3: Commit (only if changes were made)**
 
 ```bash
 git add skills/loom/SKILL.md
-git commit -m "Compress narrative sections — reduce skill word count"
+git commit -m "Remove remaining cost references from SKILL.md"
 ```
 
 ---
 
-### Task 10: Add `--max-turns` guidance to prevent silent failures
+### Task 8: Add a reliability checklist to SKILL.md
 
-One of the most common reliability failures: Claude hits the turn limit and the process exits without error, but also without producing a useful result. The skill mentions `--max-turns` but doesn't explain what happens when the limit is hit or how to detect it.
+The primary reliability problem is that Claude generates apps that deviate from the skill's patterns in ways that cause silent failures. Rather than hoping Claude follows every pattern perfectly, add an explicit checklist that Claude should verify before declaring an app complete. This addresses the review's core finding: the plan should identify *why* generated apps don't work.
 
 **Files:**
-- Modify: `skills/loom/SKILL.md` — Safety Defaults section (~line 216-244)
+- Modify: `skills/loom/SKILL.md` — add to the "What to Generate" section
 
-**Step 1: Add turn limit behavior documentation**
+**Step 1: Add a pre-delivery checklist**
 
-After the `--max-turns` paragraph, add:
+After the "What to Generate" numbered list (after item 4), add:
 
 ```markdown
-**When `--max-turns` is exceeded:** Claude stops and emits a `result` event with
-`stop_reason: "max_turns"`. The `is_error` field may be `false` even though the
-task is incomplete. Check `stop_reason` in the result event — if it's `"max_turns"`,
-the task ran out of turns and the output may be partial. Surface this to the user
-as "Task incomplete — Claude reached the turn limit" rather than showing partial
-results as if they're complete.
+### First-Run Reliability Checklist
+
+Before showing the app to the user, verify these common failure points:
+
+**Server:**
+- [ ] `express.json()` middleware is applied before any route that reads `req.body`
+- [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently inside Claude Code
+- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude can reason but can't act (silent failure)
+- [ ] `--max-turns` is set on every spawn — without it, Claude can loop indefinitely
+- [ ] All `JSON.parse` calls are wrapped in try/catch — killed processes emit partial JSON
+- [ ] `is_error` is checked on result events before accessing `structured_output`
+- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false` so it's easy to miss
+- [ ] stderr is captured on every spawn (at minimum `console.error`)
+- [ ] The `gotResult` guard fires an error event if the process exits without a result
+- [ ] If frontend and server are on different ports, CORS is configured
+
+**Frontend:**
+- [ ] SSE buffer splits on `"\n\n"` and keeps the last incomplete chunk
+- [ ] `JSON.parse` on SSE data is wrapped in try/catch
+- [ ] 401 responses redirect to the OAuth setup screen (in-memory sessions are wiped on server restart)
+- [ ] The "done" handler doesn't reference `data.cost` (subscription users)
 ```
-
-**Step 2: Update the result event handling in the SSE pattern**
-
-Add a `stop_reason` check to the result handler:
-
-```typescript
-} else if (event.type === "result") {
-  gotResult = true;
-  if (event.is_error) {
-    res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
-  } else if (event.stop_reason === "max_turns") {
-    res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
-  } else {
-    res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-  }
-}
-```
-
-**Step 3: Commit**
-
-```bash
-git add skills/loom/SKILL.md
-git commit -m "Add max_turns detection and stop_reason handling"
-```
-
----
-
-### Task 11: Fix the stdin/stdout collection pattern in parallel analysis
-
-The parallel analysis pattern at ~line 640-683 uses `chunk.toString()` for both stdout and stderr collection instead of `TextDecoder`. While `TextDecoder` isn't strictly necessary for collecting full output (as opposed to streaming), using `chunk.toString()` can corrupt multi-byte UTF-8 characters if a chunk boundary falls mid-character. This inconsistency with the `createStreamParser` guidance is confusing.
-
-**Files:**
-- Modify: `skills/loom/SKILL.md` — Parallel Analysis pattern
-
-**Step 1: Add a note about chunk.toString() vs TextDecoder**
-
-Add a comment in the parallel analysis pattern:
-
-```typescript
-// chunk.toString() is safe here because we're collecting full output
-// and parsing JSON only after the process exits. For streaming parsers,
-// use TextDecoder({ stream: true }) — see createStreamParser().
-```
-
-This avoids a confusing inconsistency without changing working code.
 
 **Step 2: Commit**
 
 ```bash
 git add skills/loom/SKILL.md
-git commit -m "Add TextDecoder note to parallel analysis pattern"
+git commit -m "Add first-run reliability checklist to What to Generate section"
 ```
 
 ---
 
-### Task 12: Verify and run all changes
+### Task 9: Final verification pass
 
-**Step 1: Run a final word count check**
+**Step 1: Verify SKILL.md line count**
 
-Run: `wc -w skills/loom/SKILL.md`
-Expected: Below 6,000 words (down from 7,111).
+Run: `wc -l skills/loom/SKILL.md`
+Expected: Under 500 lines.
 
-**Step 2: Verify no broken code snippets**
+**Step 2: Verify no broken cross-references**
 
-Scan all TypeScript code blocks in the skill for:
-- Unclosed braces/parens
-- References to removed variables (`total_cost_usd`, `lineBuf`)
-- Missing imports
+Run: `grep -n "stream_event\|content_block_start\|content_block_stop\|lineBuf\|total_cost_usd" skills/loom/SKILL.md`
+Expected: No matches (these have all been moved to the patterns reference or removed).
 
-Run: `grep -n "total_cost_usd\|lineBuf\|\.cost" skills/loom/SKILL.md`
+Run: `grep -n "stream_event" skills/loom/references/server-patterns-reference.md`
+Expected: Only in the "Events you will NOT see" section and in comments explaining why it's absent.
+
+**Step 3: Verify no orphaned cost references**
+
+Run: `grep -rn "cost\|billing" skills/loom/SKILL.md`
 Expected: No matches.
 
-**Step 3: Verify no orphaned cross-references**
+Run: `grep -n "total_cost_usd" skills/loom/references/server-patterns-reference.md`
+Expected: Only in the result event shape documentation (it's accurate), not in code examples.
 
-Run: `grep -n "cost\|budget\|billing" skills/loom/SKILL.md`
-Expected: No matches except potentially in the "What to Generate" section if it references a cost display.
+**Step 4: Verify the patterns reference has correct event handling**
 
-**Step 4: Final commit if any cleanup needed**
+Scan all result-event handlers in the patterns reference for:
+- `event.subtype === "error_max_turns"` (correct check)
+- No `event.stop_reason === "max_turns"` (incorrect check)
+- No `event.total_cost_usd` in forwarded data
+
+Run: `grep -n "stop_reason.*max_turns\|max_turns.*stop_reason" skills/loom/references/server-patterns-reference.md`
+Expected: No matches.
+
+**Step 5: Commit if any cleanup needed**
 
 ```bash
 git add -A
-git commit -m "Final cleanup pass — verify no orphaned references"
+git commit -m "Final verification pass — fix any remaining inconsistencies"
 ```
