@@ -611,13 +611,39 @@ function SetupScreen({ onComplete }) {
 
 ---
 
-## 401 Handling
+## 401 Handling: Session Expiry Round-Trip
 
-In-memory sessions don't survive server restarts. When a user's session
-is gone (server redeployed, process crashed), their browser still has
-the cookie but the server returns 401. The frontend must catch this on
-protected endpoints and redirect to the setup screen instead of trying
-to parse a non-SSE error response as a stream.
+In-memory sessions don't survive server restarts. When the server redeploys
+or crashes, every user's session is gone. Their browser still has the
+`loom_session` cookie, but the server returns 401 for any authenticated
+endpoint.
+
+### The Full Cycle
+
+    Server restart --> sessions wiped
+            |
+    Browser sends request with stale cookie
+            |
+    requireAuth returns 401  <-- also triggers on session TTL expiry
+            |
+    Frontend catches 401 BEFORE parsing response body
+            |
+    Frontend hides main app UI, shows setup screen
+            |
+    User re-authenticates via OAuth flow
+            |
+    New session created, new cookie set
+            |
+    Setup screen calls onComplete / reloads
+            |
+    Main app UI restored with fresh session
+
+### Frontend Guard (Required on Every Protected Fetch)
+
+Every `fetch()` to a protected endpoint must check for 401 **before**
+attempting to parse the response as SSE, JSON, or any other format.
+A 401 response body is JSON (`{"error":"Not authenticated"}`) -- if
+this reaches the SSE parser, it fails silently and the user sees nothing.
 
 ```javascript
 const response = await fetch("/api/chat", {
@@ -627,17 +653,32 @@ const response = await fetch("/api/chat", {
 });
 
 if (response.status === 401) {
-  // Session expired or server restarted — redirect to setup
-  showSetupScreen();
+  // Session expired or server restarted -- show setup screen
+  // Hide the main app UI and re-initialize the setup flow
+  document.getElementById('setup-screen').style.display = 'flex';
+  document.querySelector('.main-app').style.display = 'none';
+  initSetup();  // Re-initialize OAuth event listeners
   return;
 }
 
-// Continue with normal SSE stream parsing...
+// Only now parse as SSE stream
 const reader = response.body.getReader();
 ```
 
-Without this guard, a 401 JSON response gets fed to the SSE parser,
-which fails silently — the user sees nothing happen.
+### Key Implementation Details
+
+- **Re-initialize the setup screen**, don't just show/hide it. The OAuth
+  state variables (PKCE state, code input value) need to be fresh. Call
+  `initSetup()` or remount the `<SetupScreen>` component.
+- **Clear any in-progress UI state** (streaming indicators, disabled inputs)
+  before showing the setup screen.
+- **After re-auth, restore the app view** -- the setup screen's `onComplete`
+  callback should hide the setup screen and show the main app, then focus
+  the primary input.
+- **The `/api/health` endpoint does NOT require auth** -- it checks for a
+  session cookie but returns `{needsSetup: true}` instead of 401 when
+  the session is missing. This is intentional: the health check is used
+  for initial page load to determine which screen to show.
 
 ---
 

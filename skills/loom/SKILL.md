@@ -183,8 +183,10 @@ store — NOT in a shared file. Your server should:
 
 1. Use `requireAuth` middleware on protected endpoints
 2. Show the OAuth setup screen if no valid session cookie exists
-3. After token exchange, fetch the user's profile from `https://api.anthropic.com/v1/me`
-   and store it in the session — the frontend needs this to show who's logged in
+3. **After token exchange, fetch the user's profile** from `https://api.anthropic.com/v1/me`
+   using the new `access_token` as a Bearer token, and store `{name, email}` in the
+   session. Without this, the frontend can't show who's logged in — it falls back to
+   a generic "CONNECTED" label. This is the most commonly omitted step.
 4. Call `refreshSessionIfNeeded()` before spawning Claude processes
 5. Inject the user's token via `CLAUDE_CODE_OAUTH_TOKEN` env var on each spawn
 
@@ -239,10 +241,10 @@ Every pattern also handles three failure modes:
 
 #### Shared Utilities
 
-Every pattern below uses these two helpers. Define them once at the top of
+Every pattern below uses these three helpers. Define them once at the top of
 your server file.
 
-**`cleanEnv()`** — Remove nesting guards so `claude -p` can start.
+**`cleanEnv()`** — Remove nesting guards so `claude -p` can start. Used internally by `spawnEnvForUser()` below — do not call directly at spawn sites.
 
 When your server runs inside Claude Code (which it often does during
 development), two environment variables — `CLAUDECODE` and
@@ -305,6 +307,22 @@ function createStreamParser(onEvent: (event: any) => void) {
 Use `TextDecoder` with `{ stream: true }` — not `chunk.toString()` — to
 handle multi-byte UTF-8 characters that split across chunk boundaries.
 
+**`spawnEnvForUser()`** — Inject the user's OAuth token into the spawn environment.
+
+Every spawn needs the user's `CLAUDE_CODE_OAUTH_TOKEN` in the environment —
+without it, `claude -p` starts but can't authenticate with Anthropic's servers.
+This wraps `cleanEnv()` with the token injection. See
+`references/oauth-reference.md` for the full session store, `requireAuth`
+middleware, and `refreshSessionIfNeeded()` that provide `req.userSession`.
+
+```typescript
+function spawnEnvForUser(session: UserSession): NodeJS.ProcessEnv {
+  const env = cleanEnv();
+  env.CLAUDE_CODE_OAUTH_TOKEN = session.accessToken;
+  return env;
+}
+```
+
 #### Server Setup
 
 Every pattern below assumes this baseline Express setup. Define it once at
@@ -312,13 +330,19 @@ the top of your server file, alongside the shared utilities above.
 
 ```typescript
 import express from "express";
-import cookieParser from "cookie-parser";
+import cookieParser from "cookie-parser";  // npm i cookie-parser @types/cookie-parser
 import path from "path";
 
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public")));
+
+// Auth infrastructure — see references/oauth-reference.md for implementations:
+// - requireAuth middleware (validates session cookie on protected routes)
+// - refreshSessionIfNeeded() (call before every spawn)
+// - spawnEnvForUser() (injects CLAUDE_CODE_OAUTH_TOKEN into spawn env)
+// - OAuth endpoints: /api/oauth/start, /api/oauth/exchange, /api/health, /api/logout
 
 // If frontend and server run on different ports (e.g., Vite dev + Express API):
 // import cors from "cors";
@@ -336,7 +360,8 @@ Someone triggers an action → server calls Claude → returns JSON.
 // Uses Server Setup block above — app, express.json(), etc. already defined.
 import { execFileSync } from "child_process";
 
-app.post("/api/analyze", (req, res) => {
+app.post("/api/analyze", requireAuth, async (req: any, res) => {
+  await refreshSessionIfNeeded(req.userSession);
   const { content, task } = req.body;
 
   const schema = JSON.stringify({
@@ -360,7 +385,7 @@ app.post("/api/analyze", (req, res) => {
       "-p", "--model", "sonnet", "--output-format", "json",
       "--permission-mode", "dontAsk",
       "--json-schema", schema, "--tools", "", "--no-session-persistence"
-    ], { input: `${task}\n\n${content}`, encoding: "utf-8", timeout: 60000, env: cleanEnv() });
+    ], { input: `${task}\n\n${content}`, encoding: "utf-8", timeout: 60000, env: spawnEnvForUser(req.userSession) });
 
     const parsed = JSON.parse(result);
     if (parsed.is_error) {
@@ -382,8 +407,9 @@ app.post("/api/analyze", (req, res) => {
   are injection-vulnerable, and fail silently on quoting errors.
 - Don't read `structured_output` without checking `is_error` first — when
   Claude hits a tool failure, `structured_output` is `null`.
-- Don't skip env cleanup — always use `cleanEnv()` before spawning.
-  Do NOT strip all `CLAUDE_*` vars; some are required for auth.
+- Don't skip env setup — always use `spawnEnvForUser()` before spawning.
+  This calls `cleanEnv()` internally (removing nesting guards) and injects
+  the user's OAuth token. Do NOT strip all `CLAUDE_*` vars.
 
 #### Pattern: SSE Streaming
 
@@ -394,7 +420,8 @@ Use `app.post` for CSRF safety — task data stays in the body instead of the UR
 supports GET, so switch to `fetch()` + `ReadableStream` on the client for POST.)
 
 ```typescript
-app.post("/api/stream", (req, res) => {
+app.post("/api/stream", requireAuth, async (req: any, res) => {
+  await refreshSessionIfNeeded(req.userSession);
   const { task } = req.body;
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -414,7 +441,7 @@ app.post("/api/stream", (req, res) => {
     "--max-turns", "15",
     "--model", "sonnet", "--no-session-persistence",
     task
-  ], { env: cleanEnv() });
+  ], { env: spawnEnvForUser(req.userSession) });
 
   let gotResult = false;
 
@@ -502,15 +529,34 @@ Persistent connection with multi-turn conversation and streaming.
 import { WebSocketServer } from "ws";
 import { spawn, ChildProcess } from "child_process";
 import { v4 as uuidv4 } from "uuid";
+import { parse as parseCookie } from "cookie";
 
-const wss = new WebSocketServer({ port: 8080 });
+// Attach to the Express HTTP server, not a standalone port
+const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (ws) => {
+// Authenticate on upgrade — Express middleware doesn't run on WebSocket handshakes
+server.on("upgrade", (req, socket, head) => {
+  const cookies = parseCookie(req.headers.cookie || "");
+  const sessionId = cookies[SESSION_COOKIE_NAME];
+  const session = sessionId ? sessions.get(sessionId) : null;
+  if (!session) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    (ws as any).userSession = session;
+    wss.emit("connection", ws, req);
+  });
+});
+
+wss.on("connection", (ws: any) => {
+  const userSession: UserSession = ws.userSession;
   const sessionId = uuidv4();
   let activeProc: ChildProcess | null = null;
   let isFirstTurn = true;
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     const { action, payload } = JSON.parse(raw.toString());
 
     // Prevent concurrent subprocess spawns — one at a time per connection
@@ -525,6 +571,8 @@ wss.on("connection", (ws) => {
       ? ["--session-id", sessionId]
       : ["--resume", sessionId];
 
+    await refreshSessionIfNeeded(userSession);
+
     const proc = spawn("claude", [
       "-p", "--output-format", "stream-json", "--verbose",
       "--include-partial-messages",
@@ -533,7 +581,7 @@ wss.on("connection", (ws) => {
       ...sessionArgs,
       "--model", "sonnet",
       payload.prompt
-    ], { env: cleanEnv() });
+    ], { env: spawnEnvForUser(userSession) });
 
     isFirstTurn = false;
 
@@ -607,7 +655,8 @@ Long-running task that reports progress.
 ```typescript
 const jobs = new Map<string, { status: string; result?: any; error?: string }>();
 
-app.post("/api/jobs", (req, res) => {
+app.post("/api/jobs", requireAuth, async (req: any, res) => {
+  await refreshSessionIfNeeded(req.userSession);
   const jobId = uuidv4();
   jobs.set(jobId, { status: "running" });
   res.json({ jobId });
@@ -619,7 +668,7 @@ app.post("/api/jobs", (req, res) => {
     "--permission-mode", "dontAsk",
     "--tools", "Read,Bash,Glob,Grep",
     "--no-session-persistence"
-  ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv() });
+  ], { stdio: ["pipe", "pipe", "pipe"], env: spawnEnvForUser(req.userSession) });
 
   proc.stdin.write(req.body.task);
   proc.stdin.end();
@@ -672,7 +721,8 @@ Analyze multiple items concurrently, aggregate results. Uses `spawn` so each
 Claude process runs in its own child process — truly parallel.
 
 ```typescript
-app.post("/api/batch", async (req, res) => {
+app.post("/api/batch", requireAuth, async (req: any, res) => {
+  await refreshSessionIfNeeded(req.userSession);
   const { items, task } = req.body;
   const TIMEOUT_MS = 30000;
 
@@ -682,7 +732,7 @@ app.post("/api/batch", async (req, res) => {
         "-p", "--model", "haiku", "--output-format", "json",
         "--permission-mode", "dontAsk",
         "--json-schema", schema, "--tools", "", "--no-session-persistence"
-      ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv() });
+      ], { stdio: ["pipe", "pipe", "pipe"], env: spawnEnvForUser(req.userSession) });
 
       const timeout = setTimeout(() => { proc.kill(); reject(new Error("Timeout")); }, TIMEOUT_MS);
       let stdout = "";
@@ -1121,13 +1171,13 @@ and a JSON schema. Async with a timeout kill, unlike the synchronous
 `execFileSync` REST pattern.
 
 ```typescript
-async function extract<T>(prompt: string, schema: object, timeoutMs = 30000): Promise<T> {
+async function extract<T>(prompt: string, schema: object, session: UserSession, timeoutMs = 30000): Promise<T> {
   const proc = spawn("claude", [
     "-p", "--model", "haiku", "--output-format", "json",
     "--json-schema", JSON.stringify(schema),
     "--tools", "", "--no-session-persistence",
     "--permission-mode", "dontAsk"
-  ], { stdio: ["pipe", "pipe", "pipe"], env: cleanEnv() });
+  ], { stdio: ["pipe", "pipe", "pipe"], env: spawnEnvForUser(session) });
 
   const timer = setTimeout(() => proc.kill(), timeoutMs);
 
@@ -1176,7 +1226,7 @@ let proc: ChildProcess | null = null;
 let sessionActive = false;
 let lastActivity = Date.now();
 
-function startSession(systemPrompt?: string) {
+function startSession(session: UserSession, systemPrompt?: string) {
   const args = [
     "-p",
     "--input-format", "stream-json",
@@ -1189,7 +1239,7 @@ function startSession(systemPrompt?: string) {
 
   proc = spawn("claude", args, {
     stdio: ["pipe", "pipe", "pipe"],
-    env: cleanEnv(),
+    env: spawnEnvForUser(session),
   });
   sessionActive = true;
 
@@ -1534,11 +1584,15 @@ easy to miss or deviate from when generating a new app.
 
 - [ ] `--include-partial-messages` is on every streaming spawn — without it, text dumps as a single block instead of streaming token-by-token
 - [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
-- [ ] `cleanEnv()` is called on every `spawn`/`execFileSync` — without it, Claude processes fail silently when the server runs inside Claude Code
+- [ ] `spawnEnvForUser()` is called on every `spawn`/`execFileSync` — this removes nesting guards AND injects the user's OAuth token; bare `cleanEnv()` omits the token and causes silent auth failure
 - [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
 - [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false`, so unchecked it looks like success
 - [ ] `express.json()` middleware is applied before any route that reads `req.body` — without it, `req.body` is `undefined` and the spawn gets an empty prompt
 - [ ] 401 responses in the frontend redirect to the setup screen — in-memory sessions are wiped on server restart, and a 401 fed to the SSE parser fails silently
+- [ ] `cookie-parser` middleware is applied before any route that reads `req.cookies` — without it, `requireAuth` sees `undefined` and every request returns 401
+- [ ] Profile fetch happens in the `/api/oauth/exchange` handler after token exchange — without it, the frontend shows "CONNECTED" instead of the user's email
+- [ ] `/api/health` does NOT use `requireAuth` — it must return `{needsSetup: true}` for unauthenticated users, not 401
+- [ ] WebSocket upgrade validates the session cookie from `req.headers.cookie` — Express middleware does not run on WebSocket handshakes
 
 For simple apps, a single `server.ts` serving a static `index.html` is ideal.
 For complex UIs, scaffold a React frontend with a separate server.
