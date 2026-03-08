@@ -21,10 +21,25 @@ This prompts you to choose a template. Available templates:
 
 | Template | Description |
 |----------|-------------|
-| `hello-world` | Minimal app — start here for Loom desktop apps |
-| `photo-booth` | Camera integration example |
-| `interactive-playground` | API exploration sandbox |
+| `hello-world` | Minimal app — **start here for Loom desktop apps** |
+| `react-tailwind-vite` | React + Tailwind + Vite — best choice for Loom apps with rich UI |
+| `vanilla-vite` | Vanilla TypeScript + Vite |
+| `tailwind-vanilla` | Tailwind CSS without a framework |
+| `angular` | Angular framework template |
+| `solid` | SolidJS framework template |
+| `svelte` | Svelte framework template |
+| `vue` | Vue framework template |
+| `multi-window` | Multiple window management |
 | `multitab-browser` | Multi-tab browser with navigation |
+| `notes-app` | Note-taking application |
+| `photo-booth` | Camera integration example |
+| `sqlite-crud` | SQLite database operations |
+| `tray-app` | System tray application |
+| `wgpu` | Raw WebGPU rendering |
+| `wgpu-threejs` | Three.js with native WebGPU |
+| `wgpu-babylon` | Babylon.js with native WebGPU |
+| `wgpu-mlp` | WebGPU machine learning playground |
+| `bunny` | 3D bunny game demo |
 
 To skip the prompt and choose directly:
 
@@ -66,7 +81,7 @@ They communicate via typed RPC over an encrypted WebSocket — no manual HTTP la
 The `electrobun.config.ts` file defines your app:
 
 ```typescript
-import type { ElectrobunConfig } from "electrobun/config";
+import type { ElectrobunConfig } from "electrobun";
 
 export default {
   app: {
@@ -86,6 +101,9 @@ export default {
         entrypoint: "src/mainview/index.ts",
       },
     },
+    copy: {
+      "src/mainview/index.html": "views/mainview/index.html",
+    },
   },
 } satisfies ElectrobunConfig;
 ```
@@ -95,6 +113,15 @@ Key sections:
 - **`runtime`** — Behavior settings. `exitOnLastWindowClosed` controls whether the app quits when all windows close.
 - **`build.bun`** — Main process entry point. Accepts all `Bun.build()` options (plugins, external, sourcemap, etc.).
 - **`build.views`** — Named webview entry points. Each view is bundled separately.
+- **`build.copy`** — Files to copy to the build output. Keys are source paths, values are destination paths. Use this for HTML files, static assets, etc.
+
+Additional config options (see [ElectroBun docs](https://blackboard.sh/electrobun/docs/) for details):
+- **`app.urlSchemes`** — Register custom URL schemes for deep linking (macOS only)
+- **`build.useAsar`** — Pack assets into ASAR archive
+- **`build.mac.bundleWGPU`** / **`build.win.bundleWGPU`** / **`build.linux.bundleWGPU`** — Bundle WebGPU for native GPU rendering
+- **`build.targets`** — Build for specific platforms
+- **`scripts`** — Pre/post build hooks (`preBuild`, `postBuild`, `postWrap`, `postPackage`)
+- **`runtime`** — Arbitrary key-value pairs accessible at runtime via `BuildConfig.get()`
 
 ## Development Workflow
 
@@ -190,6 +217,57 @@ view.setNavigationRules([
   "https://trusted-domain.com/*",  // Allow
   "^https://blocked.com/*",        // Block (^ prefix)
 ]);
+```
+
+### GlobalShortcut
+
+Register system-wide keyboard shortcuts:
+
+```typescript
+import { GlobalShortcut } from "electrobun/bun";
+
+GlobalShortcut.register("CommandOrControl+Shift+Space", () => {
+  // Activate your app from anywhere
+  win.focus();
+});
+```
+
+### Screen
+
+Query display information (resolution, scaling, positioning):
+
+```typescript
+import { Screen } from "electrobun/bun";
+// Use for window positioning and multi-monitor support
+```
+
+### Session
+
+Manage browser sessions and cookies:
+
+```typescript
+import { Session } from "electrobun/bun";
+// Cookie management, storage partitioning
+```
+
+### BuildConfig
+
+Access build-time configuration at runtime:
+
+```typescript
+import { BuildConfig } from "electrobun/bun";
+
+const config = await BuildConfig.get();
+// config.runtime contains values from electrobun.config.ts runtime section
+```
+
+### Context Menus
+
+Right-click context menus:
+
+```typescript
+import { ContextMenu } from "electrobun/bun";
+// Define context menus for webview content
 ```
 
 ## Next Steps

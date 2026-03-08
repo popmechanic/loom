@@ -50,9 +50,8 @@ Before building, you need:
 - **ElectroBun** — `bun add electrobun` — [github.com/blackboardsh/electrobun](https://github.com/blackboardsh/electrobun)
 - **Platform**: macOS 14+, Windows 11+, or Ubuntu 22.04+ (other Linux with gtk3 & webkit2gtk-4.1)
 
-ElectroBun is currently at v1.14.4 stable (v1.14.5-beta.0 in beta). It's
-actively maintained but still evolving — check the issue tracker for
-platform-specific concerns.
+ElectroBun is currently at v1.15.1 stable. It's actively maintained but
+still evolving — check the issue tracker for platform-specific concerns.
 
 ## The Architecture: Thin Bridge
 
@@ -264,6 +263,10 @@ function resolveClaudePath(): string {
 const CLAUDE_BIN = resolveClaudePath();
 ```
 
+**Use `CLAUDE_BIN` everywhere.** Every `Bun.spawn()` and `Bun.spawnSync()` call
+in your app must use `CLAUDE_BIN` instead of the string `"claude"`. The patterns
+below all reference `CLAUDE_BIN`.
+
 **`cleanEnv()`** — Remove nesting guards so `claude -p` can start.
 
 When you develop inside Claude Code (which is common), two environment
@@ -452,7 +455,7 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
 
         try {
           const proc = Bun.spawnSync([
-            "claude", "-p",
+            CLAUDE_BIN, "-p",
             "--output-format", "json",
             "--permission-mode", "bypassPermissions",
             "--setting-sources", "",
@@ -563,7 +566,7 @@ function spawnClaude(
   args.push(prompt);
 
   // Spawn
-  const proc = Bun.spawn(["claude", ...args], {
+  const proc = Bun.spawn([CLAUDE_BIN, ...args], {
     stdout: "pipe",
     stderr: "pipe",
     env: cleanEnv(),
@@ -858,7 +861,7 @@ On app launch, verify Claude is accessible before showing the main UI:
 // In src/bun/index.ts, before creating the window:
 function checkClaudeCLI(): boolean {
   try {
-    const result = Bun.spawnSync(["claude", "--version"]);
+    const result = Bun.spawnSync([CLAUDE_BIN, "--version"]);
     return result.exitCode === 0;
   } catch {
     return false;
@@ -962,10 +965,9 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
 });
 ```
 
-Note: `spawnClaude` from Pattern 2 already appends `--session-id <id>
---continue` when `opts.sessionId` is provided. The first turn omits
-`--continue` — set that logic in `spawnClaude` by checking if the session
-has prior turns.
+Note: `spawnClaude` from Pattern 2 already handles session flags: it uses
+`--session-id <id>` on the first turn and `--resume <id>` on follow-up
+turns. The `isFirstTurn` flag controls which flag is used.
 
 **Webview-side: Chat UI**
 
@@ -1083,10 +1085,9 @@ function ChatApp() {
 
 **Don't do this:**
 - Don't spawn concurrent Claude processes on the same session — one at a time.
-  `--continue` resumes the most recent turn; parallel spawns create race
-  conditions.
-- Don't forget `--continue` on follow-up turns. Without it, Claude starts a
-  fresh conversation even with the same `--session-id`.
+  `--resume` resumes a specific session; parallel spawns create race conditions.
+- Don't forget `--resume` on follow-up turns. Without it, Claude starts a
+  fresh conversation. Use `--session-id` only on the first turn.
 
 ### Pattern 4: Background (Long-Running)
 
@@ -1748,14 +1749,17 @@ before Claude spawns, increase the timeout in your RPC configuration or
 return the `taskId` immediately (before Claude finishes) as shown in the
 streaming pattern.
 
-### 7. ElectroBun beta status
+### 7. ElectroBun version status
 
-ElectroBun is at v1.14.4 stable (March 2026). Known platform issues:
+ElectroBun is at v1.15.1 stable (March 2026). Known platform issues:
 
 - **Linux**: Self-extracting binary issues on some distributions
 - **Windows**: WebView2 preload script truncation in some configurations
 - **No `saveFileDialog()`** — use `Bun.write()` with a known path as workaround
 - **Menu support**: Full on macOS, basic on Windows, not supported on Linux
+
+New in v1.15.x: `--watch` race condition fixed, WebGPU/WGPU native rendering,
+`GpuWindow`, `GlobalShortcut`, `Screen`, `Session`, `Socket`, `BuildConfig` APIs.
 
 Check [github.com/blackboardsh/electrobun/issues](https://github.com/blackboardsh/electrobun/issues)
 for current status.
@@ -1823,8 +1827,10 @@ build: {
   views: {
     mainview: {
       entrypoint: "src/mainview/index.ts",
-      copy: ["src/mainview/index.html"],
     },
+  },
+  copy: {
+    "src/mainview/index.html": "views/mainview/index.html",
   },
 },
 ```
@@ -1939,13 +1945,45 @@ only. An Apple Silicon build won't run on an Intel Mac (and vice versa).
 If the recipient has a different architecture, they must build from source
 on their own machine.
 
+### 16. Process crash recovery
+
+Claude processes can fail for transient reasons — network timeouts, rate
+limits, or API errors. Desktop apps should handle this gracefully:
+
+```typescript
+async function spawnWithRetry(
+  taskId: string,
+  prompt: string,
+  opts: any,
+  rpc: any,
+  maxRetries = 2
+) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const proc = spawnClaude(taskId, prompt, opts, rpc);
+      const exitCode = await proc.exited;
+      if (exitCode === 0) return;
+      if (attempt < maxRetries) {
+        console.warn(`Claude exited ${exitCode}, retrying (${attempt + 1}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+    }
+  }
+}
+```
+
+Don't retry on user-initiated aborts (`SIGTERM`). Only retry on unexpected
+exits (non-zero exit code without an abort request).
+
 ## What to Generate
 
 When you build the app, produce:
 
 - [ ] `electrobun.config.ts` — App configuration (name, identifier, version, build options)
 - [ ] `src/bun/index.ts` — Main process entry: startup CLI check, window creation, menu setup
-- [ ] `src/bun/claude-manager.ts` — `cleanEnv()`, `createStreamParser()`, `spawnClaude()`, `abort()`, heartbeat, `deriveAndSendRPC()`
+- [ ] `src/bun/claude-manager.ts` — `resolveClaudePath()`, `cleanEnv()`, `createStreamParser()`, `spawnClaude()`, `abort()`, heartbeat
 - [ ] `src/bun/rpc.ts` — RPC schema type definition (`LoomRPC`) and `BrowserView.defineRPC<LoomRPC>()` with handlers
 - [ ] `src/mainview/index.html` — HTML shell (ElectroBun does NOT auto-generate this)
 - [ ] `src/mainview/index.ts` — Webview entry point with `Electroview.defineRPC<LoomRPC>()` + `new Electroview({ rpc })` setup
