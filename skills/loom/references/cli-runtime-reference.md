@@ -158,6 +158,12 @@ claude -p --allowedTools "Bash(git *)" "Bash(npm run *)" "Read(/src/**)" "Edit(/
 - `WebFetch(domain:example.com)` — domain-scoped fetch
 - `Task(worker)` — specific subagent only
 
+### Expand filesystem access
+```bash
+# Expand filesystem access beyond working directory
+claude -p --add-dir /data/shared --add-dir /tmp/uploads "analyze files"
+```
+
 ---
 
 ## Permission Modes
@@ -255,6 +261,19 @@ claude -p --output-format stream-json --verbose "Write a story" | \
     [ -n "$text" ] && printf "%s" "$text"
   done
 ```
+
+### Token-level streaming (--include-partial-messages)
+
+By default, `--output-format stream-json` delivers text only as complete
+`assistant` blocks. To get token-by-token `stream_event` deltas, add
+`--include-partial-messages`:
+
+```bash
+claude -p --output-format stream-json --verbose --include-partial-messages "Write a story"
+```
+
+Without this flag, streaming apps show text as a single dump instead of
+typing progressively. **Required for SSE/WebSocket streaming patterns.**
 
 ### Node.js stream parsing
 ```javascript
@@ -382,7 +401,6 @@ for await (const message of query({
     allowedTools: ["Read", "Edit", "Bash"],
     permissionMode: "acceptEdits",
     maxTurns: 5,
-    maxBudgetUsd: 10.00,
     model: "sonnet"
   }
 })) {
@@ -411,10 +429,14 @@ claude -p --max-turns 10 "multi-step task"
 # Fallback model for reliability
 claude -p --model sonnet --fallback-model haiku "important task"
 
-# Model selection for cost
-claude -p --model haiku "quick cheap task"    # Fast/cheap
+# Model selection
+claude -p --model haiku "quick extraction"    # Fastest
 claude -p --model sonnet "standard task"       # Balanced
-claude -p --model opus "complex task"          # Best quality
+claude -p --model opus "complex reasoning"     # Best quality
+
+# Reasoning effort
+claude -p --effort high "complex analysis task"   # Maximum reasoning
+claude -p --effort low "simple extraction"          # Fast, less reasoning
 ```
 
 ---
@@ -432,12 +454,15 @@ claude -p --model opus "complex task"          # Best quality
 | Ephemeral | `claude -p --no-session-persistence "query"` |
 | Custom persona | `claude -p --system-prompt "You are..." "query"` |
 | Append persona | `claude -p --append-system-prompt "Also do X" "query"` |
-| Fast/cheap | `claude -p --model haiku "query"` |
+| Fast model | `claude -p --model haiku "query"` |
 | Best quality | `claude -p --model opus "query"` |
 | With fallback | `claude -p --model sonnet --fallback-model haiku "query"` |
 | Turn limit | `claude -p --max-turns 10 "query"` |
 | Continue session | `claude -p --continue "follow up"` |
 | Resume session | `claude -p --resume UUID "continue"` |
+| Token streaming | `claude -p --output-format stream-json --verbose --include-partial-messages "query"` |
+| Effort control | `claude -p --effort high "query"` |
+| Extra directories | `claude -p --add-dir /path "query"` |
 
 ## Gotchas
 
@@ -447,7 +472,8 @@ claude -p --model opus "complex task"          # Best quality
 4. `structured_output` is separate from `result` in JSON output
 5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start)
 6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
-7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`.
+7. **`dontAsk` without `--allowedTools`** = silent failure. `dontAsk` auto-denies everything not explicitly allowed. Without `--allowedTools`, Claude has NO tools — it can reason but can't act. The result is an empty or incomplete response with NO error. Always pair `--permission-mode dontAsk` with `--allowedTools "Read,Bash,..."` or `--tools "Read,Bash,..."`.
 8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
 9. **`--session-id` + `--continue` errors** — Combining `--session-id` with `--continue` or `--resume` requires `--fork-session`. For multi-turn conversations, use `--session-id` on the first turn only, then `--resume <id>` on subsequent turns.
 10. **Claude reads images and PDFs natively** — The Read tool handles PNG, JPG, JPEG, GIF, WebP, BMP, and PDF files. For apps that accept file uploads or drops, save binary files to a temp directory and pass the file path in the prompt — Claude will use its Read tool to analyze them visually. Clean up temp files after the Claude process exits.
+11. **`--include-partial-messages` required for token streaming** — Without this flag, `stream-json` output delivers text only as complete `assistant` blocks (no `stream_event` tokens). Add `--include-partial-messages` to get token-by-token deltas for SSE/WebSocket streaming.
