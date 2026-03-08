@@ -244,7 +244,9 @@ Every pattern also handles three failure modes:
 Every pattern below uses these three helpers. Define them once at the top of
 your server file.
 
-**`cleanEnv()`** — Remove nesting guards so `claude -p` can start. Used internally by `spawnEnvForUser()` below — do not call directly at spawn sites.
+**`cleanEnv()`** — Remove nesting guards so `claude -p` can start.
+
+Used internally by `spawnEnvForUser()` below — do not call directly at spawn sites.
 
 When your server runs inside Claude Code (which it often does during
 development), two environment variables — `CLAUDECODE` and
@@ -316,6 +318,7 @@ This wraps `cleanEnv()` with the token injection. See
 middleware, and `refreshSessionIfNeeded()` that provide `req.userSession`.
 
 ```typescript
+// UserSession interface is defined in references/oauth-reference.md (session store)
 function spawnEnvForUser(session: UserSession): NodeJS.ProcessEnv {
   const env = cleanEnv();
   env.CLAUDE_CODE_OAUTH_TOKEN = session.accessToken;
@@ -349,7 +352,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // app.use(cors({ origin: "http://localhost:5173" }));
 
 const PORT = process.env.PORT || 3456;
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+const server = app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 ```
 
 #### Pattern: REST Endpoint (One-Shot)
@@ -535,6 +538,7 @@ import { parse as parseCookie } from "cookie";
 const wss = new WebSocketServer({ noServer: true });
 
 // Authenticate on upgrade — Express middleware doesn't run on WebSocket handshakes
+// SESSION_COOKIE_NAME and sessions are from the session store in oauth-reference.md
 server.on("upgrade", (req, socket, head) => {
   const cookies = parseCookie(req.headers.cookie || "");
   const sessionId = cookies[SESSION_COOKIE_NAME];
@@ -1573,7 +1577,8 @@ When you build the app, produce:
    (not `.setup-input`) to avoid CSS specificity conflicts with global
    `input[type="text"]` rules — see `references/oauth-reference.md`.
 3. **`package.json`** — Dependencies (`express`, `cookie-parser`, `uuid`,
-   and `cors` if frontend/server are separate origins) and a start script
+   plus `ws` and `cookie` if using WebSockets, and `cors` if frontend/server
+   are separate origins) and a start script
 4. **A one-liner to run it** — so the person can verify it works immediately
 
 ### First-Run Reliability Checklist

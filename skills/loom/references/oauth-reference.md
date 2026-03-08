@@ -642,7 +642,7 @@ endpoint.
 
 Every `fetch()` to a protected endpoint must check for 401 **before**
 attempting to parse the response as SSE, JSON, or any other format.
-A 401 response body is JSON (`{"error":"Not authenticated"}`) -- if
+A 401 response body is JSON (`{"error":"Not authenticated"}`) — if
 this reaches the SSE parser, it fails silently and the user sees nothing.
 
 ```javascript
@@ -653,11 +653,10 @@ const response = await fetch("/api/chat", {
 });
 
 if (response.status === 401) {
-  // Session expired or server restarted -- show setup screen
-  // Hide the main app UI and re-initialize the setup flow
-  document.getElementById('setup-screen').style.display = 'flex';
-  document.querySelector('.main-app').style.display = 'none';
-  initSetup();  // Re-initialize OAuth event listeners
+  // Session expired or server restarted — re-initialize setup flow
+  // React: setShowSetup(true) or remount <SetupScreen>
+  // Vanilla: showSetupScreen() — hide main UI, show setup, call initSetup()
+  showSetupScreen();
   return;
 }
 
@@ -672,10 +671,10 @@ const reader = response.body.getReader();
   `initSetup()` or remount the `<SetupScreen>` component.
 - **Clear any in-progress UI state** (streaming indicators, disabled inputs)
   before showing the setup screen.
-- **After re-auth, restore the app view** -- the setup screen's `onComplete`
+- **After re-auth, restore the app view** — the setup screen's `onComplete`
   callback should hide the setup screen and show the main app, then focus
   the primary input.
-- **The `/api/health` endpoint does NOT require auth** -- it checks for a
+- **The `/api/health` endpoint does NOT require auth** — it checks for a
   session cookie but returns `{needsSetup: true}` instead of 401 when
   the session is missing. This is intentional: the health check is used
   for initial page load to determine which screen to show.
