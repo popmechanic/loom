@@ -478,7 +478,9 @@ git commit -m "Extract distribution guide to reference file for loom-desktop ski
 
 Extract all 16 gotchas from `skills/loom-desktop/SKILL.md` (lines 1662-1979) with their full detail and code samples. Keep the numbering and full explanations.
 
-**Prose style:** Fix any stale "above"/"below" references. Specifically:
+**Prose style:** Fix any stale "above"/"below" references and "MUST" language. Specifically:
+- Line 1668 "**Must remove:**" → "**Remove:**" (imperative form — the explanation that follows already says why)
+- Line 1672 "**Must NEVER remove:**" → "**Do not remove:**" (the next sentence already explains the consequence: "kills authentication and causes silent failures")
 - Line 1738 "The `deriveAndSendRPC` function above handles both patterns" → "The `deriveAndSendRPC()` function in `desktop-patterns.md#deriveandsendrpc` handles both patterns"
 
 Include a table of contents listing all 16 gotchas by number and title. Intro: "Critical issues from real-world Loom desktop development. Read these before building — they'll save you hours of debugging."
