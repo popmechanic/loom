@@ -133,6 +133,7 @@ claude -p --add-dir /data/shared --add-dir /tmp/uploads "analyze files"
 |------|----------|----------|
 | `default` | Prompt on first use | Interactive |
 | `plan` | Read-only, then implement | Analysis first |
+| `auto` | Classifier decides per action — auto-approves safe ones, prompts on the rest | Interactive (can hang in a server when it decides to prompt) |
 | `acceptEdits` | Auto-approve file modifications | Trusted editing |
 | `dontAsk` | Auto-deny unless explicitly allowed | Server / automation |
 | `bypassPermissions` | Skip all checks | CI/CD, fully constrained tools |
@@ -173,9 +174,9 @@ unless `--fork-session` is also specified.
 
 | Flag | Purpose |
 |------|---------|
-| `--model haiku\|sonnet\|opus` | Model selection |
-| `--fallback-model haiku` | Auto-fallback on overload |
-| `--effort high\|low` | Control reasoning depth |
+| `--model haiku\|sonnet\|opus` | Model selection (Haiku 4.5 / Sonnet 4.6 / Opus 4.8; `fable` = Fable 5 when available) |
+| `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order) |
+| `--effort low\|medium\|high\|xhigh\|max` | Control reasoning depth (`xhigh` = Claude Code's coding/agentic default) |
 | `--max-turns N` | Limit agentic iterations |
 | `--max-budget-usd N` | Stop after spending limit |
 | `--system-prompt "..."` | Replace entire system prompt |
@@ -200,11 +201,13 @@ unless `--fork-session` is also specified.
 | Append persona | `claude -p --append-system-prompt "Also do X" "query"` |
 | Fast model | `claude -p --model haiku "query"` |
 | Best quality | `claude -p --model opus "query"` |
-| With fallback | `claude -p --model sonnet --fallback-model haiku "query"` |
+| With fallback | `claude -p --model opus --fallback-model sonnet,haiku "query"` |
 | Turn limit | `claude -p --max-turns 10 "query"` |
 | Cost limit | `claude -p --max-budget-usd 5 "query"` |
-| Effort control | `claude -p --effort high "query"` |
+| Effort control | `claude -p --effort xhigh "query"` (low\|medium\|high\|xhigh\|max) |
 | Extra directories | `claude -p --add-dir /path "query"` |
+| Cache-friendly prefix | `claude -p --exclude-dynamic-system-prompt-sections "query"` |
+| Skip user hooks/settings | `claude -p --setting-sources "" "query"` |
 | Ephemeral | `claude -p --no-session-persistence "query"` |
 | Continue session | `claude -p --continue "follow up"` |
 | Resume session | `claude -p --resume UUID "continue"` |
@@ -232,4 +235,10 @@ unless `--fork-session` is also specified.
 9. **`--include-partial-messages` required for token streaming** — Without this
    flag, `stream-json` delivers text only as complete `assistant` blocks.
 10. Context caching reduces cost on repeated runs — don't invalidate KV cache
-    with dynamic timestamps at prompt start.
+    with dynamic timestamps at prompt start. `--exclude-dynamic-system-prompt-sections`
+    moves per-machine sections (cwd, env, git status) out of the cached prefix.
+11. **`--bare` breaks inherited auth** — Minimal mode (`--bare`) skips hooks,
+    plugins, and CLAUDE.md for faster startup, but authenticates *only* with
+    `ANTHROPIC_API_KEY`/`apiKeyHelper` — it never reads the machine's OAuth login.
+    Local apps rely on the user's existing Claude Code credentials, so reach for
+    `--setting-sources ""` (skips user/project settings, keeps auth) instead.

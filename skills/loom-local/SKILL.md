@@ -146,11 +146,12 @@ Local apps simplify security but don't eliminate it:
 
 | Need | Flag | Why |
 |------|------|-----|
-| Fast responses (<3s) | `--model haiku` | Classification, extraction, routing |
-| Good quality, reasonable speed | `--model sonnet` | Default for most apps |
-| Best reasoning | `--model opus` | Complex analysis, code generation |
-| Reliability | `--fallback-model haiku` | Auto-fallback on overload |
-| Control reasoning depth | `--effort high` or `--effort low` | Tune thinking vs. speed |
+| Fast responses (<3s) | `--model haiku` | Classification, extraction, routing (Haiku 4.5) |
+| Good quality, reasonable speed | `--model sonnet` | Default for most apps (Sonnet 4.6) |
+| Best reasoning | `--model opus` | Complex analysis, code generation (Opus 4.8) |
+| Hardest agentic work | `--model fable` | Most capable (Fable 5) — enable when available on your plan |
+| Reliability | `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order) |
+| Control reasoning depth | `--effort low\|medium\|high\|xhigh\|max` | `xhigh` = Claude Code's coding/agentic default |
 
 For web UIs, perceived speed matters. Use streaming to show partial results
 immediately, even when using slower models.
