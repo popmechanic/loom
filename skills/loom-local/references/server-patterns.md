@@ -97,18 +97,23 @@ Every pattern below assumes this baseline `Bun.serve()` setup. Define it once
 at the top of the server file, alongside the shared utilities.
 
 ```typescript
-const PORT = Number(process.env.PORT) || 3456;
+import { resolve } from "path";
+const PORT = process.env.PORT !== undefined ? Number(process.env.PORT) : 3456;
+const PUBLIC_ROOT = resolve("./public");
 
 const server = Bun.serve({
   port: PORT,
+  hostname: "127.0.0.1",
   async fetch(req) {
     const url = new URL(req.url);
 
     // Static files
     if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-      const filePath = url.pathname === "/"
-        ? "./public/index.html"
-        : `./public${url.pathname}`;
+      const rel = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname).slice(1);
+      const filePath = resolve(PUBLIC_ROOT, rel);
+      if (filePath !== PUBLIC_ROOT && !filePath.startsWith(PUBLIC_ROOT + "/")) {
+        return new Response("Forbidden", { status: 403 });
+      }
       const file = Bun.file(filePath);
       if (await file.exists()) return new Response(file);
       return new Response("Not found", { status: 404 });
@@ -119,7 +124,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`Server running on http://localhost:${PORT}`);
+console.log(`Server running on http://127.0.0.1:${PORT}`);
 ```
 
 ---
@@ -216,16 +221,17 @@ if (url.pathname === "/api/stream" && req.method === "POST") {
           }
         } else if (event.type === "result") {
           gotResult = true;
-          if (event.is_error) {
-            encode({ type: "error", message: event.result });
-          } else if (event.subtype === "error_max_turns") {
+          if (event.subtype === "error_max_turns") {
             encode({ type: "warning", message: "Task incomplete — reached turn limit" });
+          } else if (event.is_error) {
+            encode({ type: "error", message: event.result });
           } else {
             encode({ type: "done" });
           }
         }
       });
 
+      const stderrPromise = new Response(proc.stderr).text();
       const reader = proc.stdout.getReader();
       try {
         while (true) {
@@ -240,7 +246,7 @@ if (url.pathname === "/api/stream" && req.method === "POST") {
         controller.close();
       }
 
-      const stderrText = await new Response(proc.stderr).text();
+      const stderrText = await stderrPromise;
       if (stderrText.trim()) console.error(`[claude stderr] ${stderrText.trim()}`);
     },
     cancel() {
@@ -278,6 +284,7 @@ built-in WebSocket support — no `ws` package needed.
 // Replace the Bun.serve() call with this expanded version:
 const server = Bun.serve({
   port: PORT,
+  hostname: "127.0.0.1",
   async fetch(req) {
     const url = new URL(req.url);
 
@@ -290,9 +297,11 @@ const server = Bun.serve({
 
     // Static files
     if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-      const filePath = url.pathname === "/"
-        ? "./public/index.html"
-        : `./public${url.pathname}`;
+      const rel = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname).slice(1);
+      const filePath = resolve(PUBLIC_ROOT, rel);
+      if (filePath !== PUBLIC_ROOT && !filePath.startsWith(PUBLIC_ROOT + "/")) {
+        return new Response("Forbidden", { status: 403 });
+      }
       const file = Bun.file(filePath);
       if (await file.exists()) return new Response(file);
       return new Response("Not found", { status: 404 });
@@ -308,12 +317,9 @@ const server = Bun.serve({
     },
     async message(ws, raw) {
       const data = ws.data as any;
-      const { payload } = JSON.parse(raw as string);
-
-      if (data.activeProc) {
-        ws.send(JSON.stringify({ type: "error", message: "Processing in progress" }));
-        return;
-      }
+      if (data.activeProc) { ws.send(JSON.stringify({ type: "error", message: "busy" })); return; }
+      let parsed; try { parsed = JSON.parse(raw as string); } catch { ws.send(JSON.stringify({ type: "error", message: "bad json" })); return; }
+      const { payload } = parsed;
 
       // First turn: --session-id creates the session
       // Subsequent turns: --resume continues that specific session
@@ -321,55 +327,62 @@ const server = Bun.serve({
         ? ["--session-id", data.sessionId]
         : ["--resume", data.sessionId];
 
-      const proc = Bun.spawn(["claude",
-        "-p", "--output-format", "stream-json", "--verbose",
-        "--include-partial-messages",
-        "--permission-mode", "dontAsk", "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
-        "--max-turns", "20",
-        ...sessionArgs,
-        "--model", "sonnet",
-        payload.prompt
-      ], { stdout: "pipe", stderr: "pipe", env: cleanEnv() });
+      let proc;
+      try {
+        proc = Bun.spawn(["claude",
+          "-p", "--output-format", "stream-json", "--verbose",
+          "--include-partial-messages",
+          "--permission-mode", "dontAsk", "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
+          "--max-turns", "20",
+          ...sessionArgs,
+          "--model", "sonnet",
+          payload.prompt
+        ], { stdout: "pipe", stderr: "pipe", env: cleanEnv() });
 
-      data.isFirstTurn = false;
-      data.activeProc = proc;
-      let gotResult = false;
+        data.isFirstTurn = false;
+        data.activeProc = proc;
+        let gotResult = false;
 
-      const parse = createStreamParser((event) => {
-        if (event.type === "stream_event" && event.event?.delta?.text) {
-          ws.send(JSON.stringify({ type: "token", text: event.event.delta.text }));
-        } else if (event.type === "assistant" && event.message?.content) {
-          for (const block of event.message.content) {
-            if (block.type === "tool_use") {
-              ws.send(JSON.stringify({ type: "tool", name: block.name, input: block.input }));
+        const parse = createStreamParser((event) => {
+          if (event.type === "stream_event" && event.event?.delta?.text) {
+            ws.send(JSON.stringify({ type: "token", text: event.event.delta.text }));
+          } else if (event.type === "assistant" && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === "tool_use") {
+                ws.send(JSON.stringify({ type: "tool", name: block.name, input: block.input }));
+              }
+            }
+          } else if (event.type === "result") {
+            gotResult = true;
+            if (event.subtype === "error_max_turns") {
+              ws.send(JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" }));
+            } else if (event.is_error) {
+              ws.send(JSON.stringify({ type: "error", message: event.result }));
+            } else {
+              ws.send(JSON.stringify({ type: "done" }));
             }
           }
-        } else if (event.type === "result") {
-          gotResult = true;
-          if (event.is_error) {
-            ws.send(JSON.stringify({ type: "error", message: event.result }));
-          } else if (event.subtype === "error_max_turns") {
-            ws.send(JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" }));
-          } else {
-            ws.send(JSON.stringify({ type: "done" }));
-          }
+        });
+
+        const stderrPromise = new Response(proc.stderr).text();
+        const reader = proc.stdout.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parse(value);
         }
-      });
 
-      const reader = proc.stdout.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parse(value);
+        if (!gotResult) {
+          ws.send(JSON.stringify({ type: "error", message: "Process finished without producing a result" }));
+        }
+
+        const stderrText = await stderrPromise;
+        if (stderrText.trim()) console.error(`[claude stderr] ${stderrText.trim()}`);
+      } catch (e) {
+        ws.send(JSON.stringify({ type: "error", message: String(e) }));
+      } finally {
+        if (proc && data.activeProc === proc) { proc.kill(); data.activeProc = null; }
       }
-
-      data.activeProc = null;
-      if (!gotResult) {
-        ws.send(JSON.stringify({ type: "error", message: "Process finished without producing a result" }));
-      }
-
-      const stderrText = await new Response(proc.stderr).text();
-      if (stderrText.trim()) console.error(`[claude stderr] ${stderrText.trim()}`);
     },
     close(ws) {
       const data = ws.data as any;
@@ -393,36 +406,56 @@ const server = Bun.serve({
 Long-running task that reports progress via polling.
 
 ```typescript
-const jobs = new Map<string, { status: string; result?: any; error?: string }>();
+const TIMEOUT_MS = 60000;
+const JOB_TTL_MS = 5 * 60 * 1000; // evict finished jobs after 5 minutes
+const jobs = new Map<string, { status: string; result?: any; error?: string; proc?: any; timeoutId?: any; finishedAt?: number }>();
 
 // POST /api/jobs — start a job
 if (url.pathname === "/api/jobs" && req.method === "POST") {
   const { task } = await req.json();
   const jobId = crypto.randomUUID();
-  jobs.set(jobId, { status: "running" });
+
+  // Evict stale finished jobs
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.finishedAt && now - job.finishedAt > JOB_TTL_MS) jobs.delete(id);
+  }
 
   const proc = Bun.spawn(["claude",
     "-p", "--output-format", "stream-json", "--verbose",
     "--include-partial-messages",
     "--model", "sonnet", "--max-turns", "20",
     "--permission-mode", "dontAsk",
-    "--tools", "Read,Bash,Glob,Grep",
+    "--allowedTools", "Read,Bash,Glob,Grep",
     "--no-session-persistence"
   ], { stdout: "pipe", stderr: "pipe", stdin: "pipe", env: cleanEnv() });
 
   proc.stdin.write(task);
   proc.stdin.end();
 
+  const timeoutId = setTimeout(() => {
+    proc.kill();
+    const job = jobs.get(jobId);
+    if (job?.status === "running") {
+      jobs.set(jobId, { status: "failed", error: "Timed out", finishedAt: Date.now() });
+    }
+  }, TIMEOUT_MS);
+
+  jobs.set(jobId, { status: "running", proc, timeoutId });
+
   // Process in background
   (async () => {
+    const stderrPromise = new Response(proc.stderr).text();
+
     const parse = createStreamParser((event) => {
       if (event.type === "result") {
-        if (event.is_error) {
-          jobs.set(jobId, { status: "failed", error: event.result });
-        } else if (event.subtype === "error_max_turns") {
-          jobs.set(jobId, { status: "incomplete", result: event });
+        clearTimeout(timeoutId);
+        if (event.subtype === "error_max_turns") {
+          jobs.set(jobId, { status: "incomplete", result: event, finishedAt: Date.now() });
+        } else if (event.is_error) {
+          jobs.set(jobId, { status: "failed", error: event.result, finishedAt: Date.now() });
         } else {
-          jobs.set(jobId, { status: "complete", result: event });
+          jobs.set(jobId, { status: "complete", result: event, finishedAt: Date.now() });
         }
       }
     });
@@ -434,9 +467,11 @@ if (url.pathname === "/api/jobs" && req.method === "POST") {
       parse(value);
     }
 
+    const stderrText = await stderrPromise;
     if (jobs.get(jobId)?.status === "running") {
-      const stderrText = await new Response(proc.stderr).text();
-      jobs.set(jobId, { status: "failed", error: stderrText.trim() || "Process exited unexpectedly" });
+      jobs.set(jobId, { status: "failed", error: stderrText.trim() || "Process exited unexpectedly", finishedAt: Date.now() });
+    } else if (stderrText.trim()) {
+      console.error(`[claude stderr] ${stderrText.trim()}`);
     }
   })();
 
@@ -447,7 +482,9 @@ if (url.pathname === "/api/jobs" && req.method === "POST") {
 if (url.pathname.startsWith("/api/jobs/") && req.method === "GET") {
   const jobId = url.pathname.split("/api/jobs/")[1];
   const job = jobs.get(jobId);
-  return Response.json(job || { status: "not_found" });
+  if (!job) return Response.json({ status: "not_found" });
+  const { proc: _proc, timeoutId: _tid, ...safe } = job;
+  return Response.json(safe);
 }
 ```
 
@@ -567,9 +604,15 @@ source.onmessage = (e) => {
 };
 ```
 
+**Note:** `EventSource` puts the full prompt in the URL query string, which
+appears in server logs and browser history. For any prompt that may contain
+sensitive input, use the `fetch()` + POST approach above instead.
+
 ### Structured Result Rendering
 
 ```javascript
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 async function getAnalysis(content) {
   const res = await fetch("/api/analyze", {
     method: "POST",
@@ -581,13 +624,14 @@ async function getAnalysis(content) {
   document.getElementById("summary").textContent = summary;
   const list = document.getElementById("findings");
   list.innerHTML = findings.map(f =>
-    `<div class="finding ${f.severity}">
-       <strong>${f.title}</strong>
-       <p>${f.description}</p>
-     </div>`
+    `<div class="finding ${esc(f.severity)}"><strong>${esc(f.title)}</strong><p>${esc(f.description)}</p></div>`
   ).join("");
 }
 ```
+
+**Don't do this:**
+- Don't use raw `innerHTML` with unescaped model output — in a same-origin
+  app with Bash tools enabled, XSS in the page is remote code execution.
 
 ---
 
@@ -607,3 +651,18 @@ denied (tool not in `--allowedTools`), or process killed by timeout. For
 client disconnect). Stdout contains partial JSON that won't parse. Always wrap
 `JSON.parse` in try/catch, and always check `parsed.is_error` before reaching
 for `structured_output`.
+
+---
+
+## Tool Flag Reference
+
+Two flags control which tools Claude can use:
+
+- `--tools <list>` — selects which built-in tools exist in this invocation;
+  `--tools ""` disables all built-in tools entirely.
+- `--allowedTools <list>` — auto-approves the listed tools so Claude can use
+  them without a permission prompt; tools not in the list still exist but
+  require approval (or are blocked in `--permission-mode dontAsk`).
+
+Use `--tools ""` for pure-analysis tasks where no file access is needed. Use
+`--allowedTools` to specify which tools Claude may act on in agentic tasks.
