@@ -1,14 +1,16 @@
 ---
 name: loom
 description: >
-  Use when building a web application that needs Claude Code CLI (`claude -p`)
-  or the Agent SDK as its backend runtime — a server that spawns Claude
-  processes to power a custom browser interface. Triggers: "build an app that
-  uses Claude", "Claude as backend/runtime", "Claude-powered web app", "wrap
-  claude -p in a server", "streaming Claude output to browser", or any web app
-  needing Claude's agentic capabilities through a purpose-built interface. NOT
-  for direct Anthropic API usage, simple chat replicas, or desktop apps (use
-  loom-desktop).
+  Build server-based web applications where Claude Code CLI (`claude -p`) is
+  the backend runtime — a Node/Express server spawns Claude processes to power
+  a custom browser interface with streaming output.
+when_to_use: >
+  Use when building a deployed or multi-user web app on a server, handling
+  per-user Anthropic OAuth, rate limiting, or persistent sessions. Triggers:
+  "build an app that uses Claude", "Claude as backend/runtime", "wrap claude -p
+  in a server", "streaming Claude output to browser". NOT for local single-user
+  tools (use loom-local), desktop apps (use loom-desktop), or direct Anthropic
+  API usage.
 ---
 
 # Loom: Applications on the Claude Code Runtime
@@ -372,7 +374,7 @@ for each, but they're easy to miss or deviate from when generating a new app.
 - [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
 - [ ] `spawnEnvForUser()` is called on every `spawn`/`execFileSync` — this removes nesting guards AND injects the user's OAuth token; bare `cleanEnv()` omits the token and causes silent auth failure
 - [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
-- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false`, so unchecked it looks like success
+- [ ] `subtype === "error_max_turns"` is checked **before** `is_error` on result events — max-turns sets `is_error: true` (verified on CLI v2.1.x), so an `if (is_error) … else if (subtype === …)` ordering makes the max-turns branch dead code and surfaces "incomplete" as a hard error
 - [ ] `express.json()` middleware is applied before any route that reads `req.body` — without it, `req.body` is `undefined` and the spawn gets an empty prompt
 - [ ] 401 responses in the frontend redirect to the setup screen — in-memory sessions are wiped on server restart, and a 401 fed to the SSE parser fails silently
 - [ ] `cookie-parser` middleware is applied before any route that reads `req.cookies` — without it, `requireAuth` sees `undefined` and every request returns 401
