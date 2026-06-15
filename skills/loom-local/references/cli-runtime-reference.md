@@ -3,7 +3,7 @@
 A focused reference for `claude -p` (print mode) flags used in local Bun
 apps. For the complete reference including MCP servers, hooks, the Agent SDK,
 and custom agent definitions, see the
-[Claude Code documentation](https://docs.anthropic.com/en/docs/claude-code).
+[Claude Code documentation](https://docs.claude.com/en/docs/claude-code).
 
 ---
 
