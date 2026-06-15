@@ -1,6 +1,6 @@
 # Loom — Developer Guide
 
-This repo is a Claude Code plugin that ships two skills: `loom` (web apps) and `loom-desktop` (native desktop apps via ElectroBun). Both teach Claude how to build applications where `claude -p` is the runtime.
+This repo is a Claude Code plugin that ships three skills: `loom` (deployed/multi-user web apps), `loom-local` (single-user local web tools), and `loom-desktop` (native desktop apps via ElectroBun). All three teach Claude how to build applications where `claude -p` is the runtime.
 
 ## What Gets Distributed
 
@@ -52,7 +52,12 @@ and was removed for consistency across the three skills.
 > endpoint or wiring up the frontend.
 ```
 
-**Descriptions:** Start with "Use when..." and list triggering conditions. Never summarize what the skill does in the description — that causes Claude to follow the description instead of reading the full skill.
+**Descriptions:** Each skill uses two frontmatter fields. `description` is a
+one-line summary of what the skill builds; `when_to_use` starts with "Use
+when..." and lists triggering conditions and exclusions. Claude Code
+concatenates the two into the effective trigger text (combined cap ~1,536
+chars), so keep them complementary, not redundant. Do not collapse the triggers
+into `description` — the split is intentional and keeps each field readable.
 
 ## Testing Changes
 
