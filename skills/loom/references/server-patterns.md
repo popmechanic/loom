@@ -160,7 +160,11 @@ Someone triggers an action → server calls Claude → returns JSON.
 import { execFileSync } from "child_process";
 
 app.post("/api/analyze", requireAuth, async (req: any, res) => {
-  await refreshSessionIfNeeded(req.userSession);
+  try {
+    await refreshSessionIfNeeded(req.userSession);
+  } catch {
+    return res.status(401).json({ error: "Session expired — please sign in again" });
+  }
   const { content, task } = req.body;
 
   const schema = JSON.stringify({
@@ -222,13 +226,24 @@ supports GET, so switch to `fetch()` + `ReadableStream` on the client for POST.)
 
 ```typescript
 app.post("/api/stream", requireAuth, async (req: any, res) => {
-  await refreshSessionIfNeeded(req.userSession);
+  try {
+    await refreshSessionIfNeeded(req.userSession);
+  } catch {
+    return res.status(401).json({ error: "Session expired — please sign in again" });
+  }
   const { task } = req.body;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
+
+  // Guard SSE writes: if the client disconnected mid-stream, res.write throws
+  // (and crashes the process) from inside async stream callbacks. Swallow it.
+  const send = (payload: unknown) => {
+    if (res.writableEnded) return;
+    try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* client gone */ }
+  };
 
   // Heartbeat keeps connections alive through proxies (nginx, Cloudflare)
   const heartbeat = setInterval(() => {
@@ -256,23 +271,23 @@ app.post("/api/stream", requireAuth, async (req: any, res) => {
     // The assistant event re-delivers the complete text — DO NOT forward it
     // or the frontend will display every token twice.
     if (event.type === "stream_event" && event.event?.delta?.text) {
-      res.write(`data: ${JSON.stringify({ type: "token", text: event.event.delta.text })}\n\n`);
+      send({ type: "token", text: event.event.delta.text });
     } else if (event.type === "assistant" && event.message?.content) {
       // Only forward tool_use — text was already streamed via stream_event.
       for (const block of event.message.content) {
         if (block.type === "tool_use") {
-          res.write(`data: ${JSON.stringify({ type: "tool", name: block.name })}\n\n`);
+          send({ type: "tool", name: block.name });
         }
       }
     } else if (event.type === "result") {
       gotResult = true;
       if (event.subtype === "error_max_turns") {
         // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
-        res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
+        send({ type: "warning", message: "Task incomplete — reached turn limit" });
       } else if (event.is_error) {
-        res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
+        send({ type: "error", message: event.result });
       } else {
-        res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+        send({ type: "done" });
       }
     }
   });
@@ -287,16 +302,16 @@ app.post("/api/stream", requireAuth, async (req: any, res) => {
   proc.on("close", (code) => {
     clearInterval(heartbeat);
     if (!gotResult) {
-      res.write(`data: ${JSON.stringify({ type: "error", message: code !== 0
+      send({ type: "error", message: code !== 0
         ? `Claude exited with code ${code}`
-        : "Process finished without producing a result" })}\n\n`);
+        : "Process finished without producing a result" });
     }
     res.end();
   });
 
   proc.on("error", (err) => {
     clearInterval(heartbeat);
-    res.write(`data: ${JSON.stringify({ type: "error", message: err.message })}\n\n`);
+    send({ type: "error", message: err.message });
     res.end();
   });
 
@@ -388,7 +403,13 @@ wss.on("connection", (ws: any) => {
       ? ["--session-id", sessionId]
       : ["--resume", sessionId];
 
-    await refreshSessionIfNeeded(userSession);
+    try {
+      await refreshSessionIfNeeded(userSession);
+    } catch {
+      ws.send(JSON.stringify({ type: "error", message: "Session expired" }));
+      ws.close();
+      return;
+    }
 
     const proc = spawn("claude", [
       "-p", "--output-format", "stream-json", "--verbose",
@@ -505,9 +526,15 @@ setInterval(() => {
 }, 60_000);
 
 app.post("/api/jobs", requireAuth, async (req: any, res) => {
-  await refreshSessionIfNeeded(req.userSession);
+  try {
+    await refreshSessionIfNeeded(req.userSession);
+  } catch {
+    return res.status(401).json({ error: "Session expired — please sign in again" });
+  }
   const jobId = uuidv4();
-  const ownerSessionId = req.session.id as string;
+  // Owner id = the session cookie value (requireAuth already validated it).
+  // req.session does not exist — there is no express-session middleware.
+  const ownerSessionId = req.cookies[SESSION_COOKIE_NAME] as string;
 
   const proc = spawn("claude", [
     "-p", "--output-format", "stream-json", "--verbose",
@@ -583,7 +610,7 @@ app.get("/api/jobs/:id", requireAuth, (req: any, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.json({ status: "not_found" });
   // Prevent job-ID enumeration: only the session that created the job can read it.
-  if (job.ownerSessionId !== req.session.id) {
+  if (job.ownerSessionId !== req.cookies[SESSION_COOKIE_NAME]) {
     return res.status(403).json({ error: "Forbidden" });
   }
   // Omit proc handle from the response (it's not serializable).
@@ -606,12 +633,37 @@ Claude process runs in its own child process — truly parallel.
 
 ```typescript
 app.post("/api/batch", requireAuth, async (req: any, res) => {
-  await refreshSessionIfNeeded(req.userSession);
+  try {
+    await refreshSessionIfNeeded(req.userSession);
+  } catch {
+    return res.status(401).json({ error: "Session expired — please sign in again" });
+  }
   const { items, task } = req.body;
   const TIMEOUT_MS = 30000;
+  const MAX_ITEMS = 20;
+  const CONCURRENCY = 4;
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "items must be a non-empty array" });
+  }
+  if (items.length > MAX_ITEMS) {
+    return res.status(400).json({ error: `Too many items (max ${MAX_ITEMS})` });
+  }
 
-  const outcomes = await Promise.allSettled(
-    items.map((item: string) => new Promise<any>((resolve, reject) => {
+  // Bounded pool: at most CONCURRENCY claude processes alive at once.
+  async function mapWithConcurrency<T, R>(arr: T[], limit: number, fn: (item: T, i: number) => Promise<R>) {
+    const results: PromiseSettledResult<R>[] = new Array(arr.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, arr.length) }, async () => {
+      while (next < arr.length) {
+        const i = next++;
+        try { results[i] = { status: "fulfilled", value: await fn(arr[i], i) }; }
+        catch (reason) { results[i] = { status: "rejected", reason } as PromiseSettledResult<R>; }
+      }
+    }));
+    return results;
+  }
+
+  const outcomes = await mapWithConcurrency(items, CONCURRENCY, (item: string) => new Promise<any>((resolve, reject) => {
       const proc = spawn("claude", [
         "-p", "--model", "haiku", "--output-format", "json",
         "--permission-mode", "dontAsk",
@@ -652,8 +704,7 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
       proc.stdin.on("error", () => {});
       proc.stdin.write(`${task}\n\n${item}`);
       proc.stdin.end();
-    }))
-  );
+    }));
 
   const results = outcomes.map((o, i) =>
     o.status === "fulfilled"
