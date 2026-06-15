@@ -50,7 +50,7 @@ bunx electrobun init hello-world
 After initialization, install dependencies:
 
 ```bash
-cd myapp
+cd hello-world
 bun install
 ```
 
