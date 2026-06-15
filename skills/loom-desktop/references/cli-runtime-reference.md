@@ -3,6 +3,10 @@
 A complete technical reference for using `claude -p` (print mode) and the Agent SDK
 to build applications where Claude is the runtime.
 
+> Verified against Claude Code 2.x (`claude --help`). Flag names and behavior are
+> stable across the 2.x line — run `claude --help` to confirm against your
+> installed version.
+
 ## Table of Contents
 
 1. [Input Methods](#input-methods)
@@ -169,11 +173,16 @@ claude -p --allowedTools "Bash(git *)" "Bash(npm run *)" "Read(/src/**)" "Edit(/
 |------|----------|----------|
 | `default` | Prompt on first use | Interactive |
 | `plan` | Read-only, then implement | Analysis first |
+| `auto` | Classifier decides per action — auto-approves safe ones, prompts on the rest | Interactive/assisted (can hang when it decides to prompt) |
 | `acceptEdits` | Auto-approve file modifications | Trusted editing |
 | `dontAsk` | Auto-deny unless explicitly allowed | Safe mode |
 | `bypassPermissions` | Skip all checks | CI/CD, automation |
 
 Shorthand: `--dangerously-skip-permissions` = `--permission-mode bypassPermissions`
+
+For desktop apps, prefer `bypassPermissions` with an explicit `--tools` list:
+`dontAsk` also blocks reads outside the project directory, so dropped files from
+`~/Desktop` won't be accessible (see Gotchas).
 
 ---
 
@@ -404,20 +413,30 @@ async for msg in query(prompt="Now find callers", options=ClaudeAgentOptions(res
 ## Cost and Safety Controls
 
 ```bash
-# Budget cap
+# Budget cap — hard dollar ceiling per invocation (print mode only)
 claude -p --max-budget-usd 5.00 "expensive task"
 
 # Turn limit
 claude -p --max-turns 10 "multi-step task"
 
-# Fallback model for reliability
-claude -p --model sonnet --fallback-model haiku "important task"
+# Fallback model(s) for reliability — comma-separated, tried in order on overload
+claude -p --model opus --fallback-model sonnet,haiku "important task"
 
 # Model selection for cost
-claude -p --model haiku "quick cheap task"    # Fast/cheap
-claude -p --model sonnet "standard task"       # Balanced
-claude -p --model opus "complex task"          # Best quality
+claude -p --model haiku "quick cheap task"     # Fast/cheap (Haiku 4.5)
+claude -p --model sonnet "standard task"        # Balanced (Sonnet 4.6)
+claude -p --model opus "complex task"           # Best quality (Opus 4.8)
+# claude -p --model fable "hardest agentic work" # Most capable (Fable 5) — uncomment when available on your plan
+
+# Reasoning effort: low | medium | high | xhigh | max
+claude -p --effort xhigh "agentic coding task"  # Claude Code's own default for coding/agentic work
+claude -p --effort low "quick extraction"       # Fast, minimal reasoning
 ```
+
+`--effort` is a separate axis from model choice — it trades latency and token
+spend for depth. `xhigh` (between `high` and `max`) is the setting Claude Code
+uses for its own coding and agentic work; drop to `low`/`medium` for
+classification and extraction.
 
 ---
 
@@ -436,10 +455,12 @@ claude -p --model opus "complex task"          # Best quality
 | Append persona | `claude -p --append-system-prompt "Also do X" "query"` |
 | Fast/cheap | `claude -p --model haiku "query"` |
 | Best quality | `claude -p --model opus "query"` |
-| With fallback | `claude -p --model sonnet --fallback-model haiku "query"` |
+| With fallback | `claude -p --model opus --fallback-model sonnet,haiku "query"` |
 | Budget cap | `claude -p --max-budget-usd 5 "query"` |
 | Turn limit | `claude -p --max-turns 10 "query"` |
+| Effort control | `claude -p --effort xhigh "query"` (low\|medium\|high\|xhigh\|max) |
 | Skip user hooks/settings | `claude -p --setting-sources "" "query"` |
+| Cache-friendly prefix | `claude -p --exclude-dynamic-system-prompt-sections "query"` |
 | Continue session | `claude -p --continue "follow up"` |
 | Resume session | `claude -p --resume UUID "continue"` |
 
@@ -449,7 +470,7 @@ claude -p --model opus "complex task"          # Best quality
 2. `--input-format stream-json` **requires** `--output-format stream-json`
 3. MCP tools load by default — use `--strict-mcp-config` to control
 4. `structured_output` is separate from `result` in JSON output
-5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start)
+5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start). `--exclude-dynamic-system-prompt-sections` moves per-machine sections (cwd, env, git status) out of the cached prefix.
 6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
 7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`. Also, `dontAsk` blocks reads outside the project directory — prefer `bypassPermissions` for desktop apps.
 8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
@@ -458,3 +479,4 @@ claude -p --model opus "complex task"          # Best quality
 11. **Extended thinking affects multiple models** — Not just haiku-4.5: sonnet-4.6 and others use extended thinking too. The `assistant` event arrives with `[{type:"thinking"}, {type:"text"}]` — the thinking block has no visible output, so the UI looks "stuck" until text arrives. Filter out thinking blocks in your stream handler.
 12. **`--session-id` + `--continue` errors** — Combining `--session-id` with `--continue` or `--resume` requires `--fork-session`. For multi-turn conversations, use `--session-id` on the first turn only, then `--resume <id>` on subsequent turns.
 13. **Claude reads images and PDFs natively** — The Read tool handles PNG, JPG, JPEG, GIF, WebP, BMP, and PDF files. For apps that accept file uploads or drops, save binary files to a temp directory and pass the file path in the prompt — Claude will use its Read tool to analyze them visually. Clean up temp files after the Claude process exits.
+14. **`--bare` breaks inherited auth** — Minimal mode (`--bare`) skips hooks, plugins, and CLAUDE.md for the fastest startup, but authenticates *only* with `ANTHROPIC_API_KEY`/`apiKeyHelper` — it never reads the machine's OAuth login or keychain. Desktop apps depend on the user's existing Claude Code credentials (`CLAUDE_CODE_OAUTH_TOKEN`), so use `--setting-sources ""` to skip user settings instead; it keeps auth intact (gotcha #9 in `@references/gotchas.md`).

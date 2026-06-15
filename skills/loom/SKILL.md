@@ -165,10 +165,17 @@ Web apps add security concerns that CLIs don't have:
 
 | Need | Model | Why |
 |------|-------|-----|
-| Fast responses (<3s) | `haiku` | Classification, extraction, routing |
-| Good quality, reasonable speed | `sonnet` | Default for most apps |
-| Best reasoning | `opus` | Complex analysis, code generation |
-| Reliability | `--fallback-model haiku` | Auto-fallback on overload |
+| Fast responses (<3s) | `haiku` | Classification, extraction, routing (Haiku 4.5) |
+| Good quality, reasonable speed | `sonnet` | Default for most apps (Sonnet 4.6) |
+| Best reasoning | `opus` | Complex analysis, code generation (Opus 4.8) |
+| Hardest agentic work | `fable` | Most capable (Fable 5) — enable when available on your plan |
+| Reliability | `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order) |
+
+Reasoning depth is a separate axis from model choice: `--effort` takes
+`low | medium | high | xhigh | max`. `xhigh` is Claude Code's own default for
+coding/agentic work; use `low`/`medium` for routing and extraction. The `fable`
+alias resolves to Anthropic's most capable model — the CLI recognizes it, so
+swap it in for `opus` on the hardest tasks once it's available on your plan.
 
 For web UIs, perceived speed matters. Use streaming to show partial results
 immediately, even when using slower models.
@@ -228,6 +235,12 @@ but can't act, and the failure is silent (no error, just missing results).
 **`--max-turns`** — Prevents
 conversational loops where Claude keeps trying approaches that won't work.
 `5` for one-shot tasks, `10-15` for streaming, `20` for multi-turn sessions.
+
+**`--max-budget-usd`** (recommended for unattended runs) — A hard dollar ceiling
+per invocation. `--max-turns` bounds the loop count; `--max-budget-usd` bounds the
+spend. For a server running Claude processes nobody is watching, set both so a
+runaway task can't burn turns *or* budget. Print-mode only — silently ignored
+outside `-p`.
 
 Every pattern also handles three failure modes:
 
