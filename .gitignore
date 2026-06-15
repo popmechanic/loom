@@ -16,8 +16,9 @@ explainer.html
 node_modules/
 .DS_Store
 
-# Local config
-.claude/settings.local.json
+# Local config and Claude Code run artifacts (settings, installed workflow
+# harnesses, and ultrapowers worktrees) — all machine-local / regenerated.
+.claude/
 
 # Plans and docs (local only)
 docs/
