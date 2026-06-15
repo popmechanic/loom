@@ -448,8 +448,8 @@ classification and extraction.
 | JSON response | `claude -p --output-format json "query"` |
 | Streaming | `claude -p --output-format stream-json --verbose "query"` |
 | Structured data | `claude -p --output-format json --json-schema '{...}' "query"` |
-| No tools (pure LLM) | `claude -p --permission-mode bypassPermissions "query"` |
-| Full autonomy | `claude -p --permission-mode bypassPermissions "query"` |
+| No tools (pure LLM) | `claude -p --permission-mode bypassPermissions --tools "" "query"` |
+| Full autonomy (explicit allowlist) | `claude -p --permission-mode bypassPermissions --tools Read,Bash "query"` |
 | Ephemeral | `claude -p --no-session-persistence "query"` |
 | Custom persona | `claude -p --system-prompt "You are..." "query"` |
 | Append persona | `claude -p --append-system-prompt "Also do X" "query"` |
