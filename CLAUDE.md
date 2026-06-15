@@ -8,6 +8,7 @@ Only `skills/` and plugin metadata ship to users. Everything else is local dev t
 
 **Distributed (tracked in git):**
 - `skills/loom/` — web app skill (SKILL.md + references/)
+- `skills/loom-local/` — local web app skill (SKILL.md + references/)
 - `skills/loom-desktop/` — desktop app skill (SKILL.md + references/)
 - `.claude-plugin/plugin.json` — plugin metadata (name, version, description)
 - `assets/` — logo images
