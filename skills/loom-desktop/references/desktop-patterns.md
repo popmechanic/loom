@@ -260,11 +260,16 @@ function deriveAndSendRPC(
     }
 
     case "result":
-      rpc.sendProxy.done({
-        taskId,
-        cost: event.total_cost_usd ?? 0,
-        duration: event.duration_ms ?? 0,
-      });
+      // Check the turn-limit subtype BEFORE the generic is_error flag: on
+      // error_max_turns the `result` field is often empty, so is_error alone
+      // would surface a blank error message. Naming the cause is more useful.
+      if (event.subtype === "error_max_turns") {
+        rpc.sendProxy.error({ taskId, message: "Task incomplete — reached turn limit" });
+      } else if (event.is_error) {
+        rpc.sendProxy.error({ taskId, message: event.result ?? "Claude reported an error" });
+      } else {
+        rpc.sendProxy.done({ taskId, cost: event.total_cost_usd });
+      }
       currentState = "idle";
       break;
   }
@@ -552,11 +557,16 @@ function spawnClaude(
       }
 
       case "result":
-        rpc.sendProxy.done({
-          taskId,
-          cost: event.total_cost_usd ?? 0,
-          duration: event.duration_ms ?? 0,
-        });
+        // Check the turn-limit subtype BEFORE the generic is_error flag: on
+        // error_max_turns the `result` field is often empty, so is_error alone
+        // would surface a blank error message. Naming the cause is more useful.
+        if (event.subtype === "error_max_turns") {
+          rpc.sendProxy.error({ taskId, message: "Task incomplete — reached turn limit" });
+        } else if (event.is_error) {
+          rpc.sendProxy.error({ taskId, message: event.result ?? "Claude reported an error" });
+        } else {
+          rpc.sendProxy.done({ taskId, cost: event.total_cost_usd, duration: event.duration_ms ?? 0 });
+        }
         cleanup();
         break;
     }
