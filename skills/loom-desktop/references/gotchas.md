@@ -80,6 +80,11 @@ deny the request.
 apps. You control the prompt and tools list, so `bypassPermissions` is safe
 and avoids the filesystem scope restriction.
 
+With `bypassPermissions` you must pass an explicit, minimal `--tools`
+allowlist; never omit it — omitting `--tools` grants access to all tools on
+the whole filesystem. Treat dropped-file content as untrusted input: it must
+not be able to expand the effective tool scope.
+
 **Alternative:** Read files in the Bun process (via `FileReader` in the
 webview → RPC → Bun), and include the content directly in the prompt. This
 way Claude doesn't need `Read` access at all for dropped files.
@@ -270,6 +275,8 @@ spawn fails with "Executable not found in $PATH".
 login shell, then use it for all subsequent spawns:
 
 ```typescript
+import fs from "fs";
+
 function resolveClaudePath(): string {
   // Try interactive login shell (sources both .zprofile AND .zshrc)
   for (const flags of ["-lic", "-lc", "-ic"]) {
@@ -296,8 +303,8 @@ function resolveClaudePath(): string {
 
   for (const p of candidates) {
     try {
-      const file = Bun.file(p);
-      if (file.size > 0) return p;
+      fs.accessSync(p, fs.constants.X_OK);
+      return p;
     } catch {}
   }
 
