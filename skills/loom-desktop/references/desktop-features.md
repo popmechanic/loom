@@ -14,35 +14,65 @@ Desktop-specific features for Loom apps: file handling, native UX, and access co
 
 ## File Drag-and-Drop
 
-Users drop files onto the window for Claude to analyze. **Important:**
-`File.path` is an Electron-specific extension — it does NOT exist in WKWebView
-(macOS), WebView2 (Windows), or WebKit2GTK (Linux). Use
-`FileReader.readAsText()` in the webview and send file content over RPC.
+Drag-and-drop supports **text files only**. PDFs, images, and other binary
+files cannot be read via `FileReader.readAsText()` — doing so produces mojibake
+injected directly into the prompt. For PDFs and images, direct the user to
+the native **Open File…** dialog (see [Native File Dialogs](#native-file-dialogs)),
+which returns a real filesystem path that Claude's `Read` tool handles natively
+(PDFs and images included).
 
-This changes the architecture: the Bun process receives file content directly,
-not filesystem paths. This also avoids `dontAsk` permission issues — Claude
-doesn't need to `Read` files that were already loaded into memory.
+**Why text-only?** `File.path` is an Electron-specific extension — it does NOT
+exist in WKWebView (macOS), WebView2 (Windows), or WebKit2GTK (Linux). System
+webviews can't expose a dropped file's real path (gotcha #12 in `desktop-patterns.md`),
+so the only in-webview option is `FileReader.readAsText()`, which only works
+for text. For binary files the correct path is: native dialog → filesystem path
+→ Claude's `Read` tool.
 
-**Webview-side: Drop handler (reads content via FileReader)**
+**Webview-side: Text-type guard**
+
+```typescript
+const TEXT_EXT = /\.(txt|md|markdown|json|ya?ml|csv|tsv|js|ts|tsx|jsx|py|rb|go|rs|java|c|h|cpp|sh|html|css|xml|log)$/i;
+
+function isTextFile(file: File): boolean {
+  return file.type.startsWith("text/") || file.type === "application/json" || TEXT_EXT.test(file.name);
+}
+```
+
+**Webview-side: Drop handler (text-only, binary redirected to Open File…)**
 
 ```tsx
 type DroppedFile = { name: string; content: string };
 
-function DropZone({ onFilesRead }: { onFilesRead: (files: DroppedFile[]) => void }) {
+function DropZone({
+  onFilesRead,
+  onStatusMessage,
+}: {
+  onFilesRead: (files: DroppedFile[]) => void;
+  onStatusMessage: (msg: string) => void;
+}) {
   const [dragging, setDragging] = useState(false);
 
-  async function readFiles(fileList: FileList) {
-    const files: DroppedFile[] = [];
+  async function handleDrop(fileList: FileList) {
+    const textFiles: DroppedFile[] = [];
     for (const file of Array.from(fileList)) {
-      const content = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = () => reject(reader.error);
-        reader.readAsText(file);
-      });
-      files.push({ name: file.name, content });
+      if (isTextFile(file)) {
+        const content = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsText(file);
+        });
+        textFiles.push({ name: file.name, content });
+      } else {
+        // System webviews can't expose a dropped file's path (gotcha #12), and reading a
+        // PDF/image as text yields garbage. Send the user to the native Open File dialog,
+        // which returns a real path that Claude reads natively.
+        onStatusMessage(
+          `${file.name}: add PDFs/images via "Open File…" — drag-and-drop only supports text files.`
+        );
+      }
     }
-    return files;
+    if (textFiles.length > 0) onFilesRead(textFiles);
   }
 
   return (
@@ -53,11 +83,10 @@ function DropZone({ onFilesRead }: { onFilesRead: (files: DroppedFile[]) => void
       onDrop={async (e) => {
         e.preventDefault();
         setDragging(false);
-        const files = await readFiles(e.dataTransfer.files);
-        if (files.length > 0) onFilesRead(files);
+        await handleDrop(e.dataTransfer.files);
       }}
     >
-      Drop files here to analyze
+      Drop text files here to analyze (PDFs/images: use Open File…)
     </div>
   );
 }
@@ -65,7 +94,7 @@ function DropZone({ onFilesRead }: { onFilesRead: (files: DroppedFile[]) => void
 
 **Bun-side: Incorporating file content into prompts**
 
-The webview sends file content (not paths) via RPC. Include it directly
+The webview sends text file content (not paths) via RPC. Include it directly
 in the prompt — Claude doesn't need filesystem tools to read it:
 
 ```typescript
@@ -77,8 +106,9 @@ const fullPrompt = prompt + fileContext;
 ```
 
 Since file content is embedded in the prompt, Claude doesn't need `Read`
-tool access for dropped files. This also avoids the `dontAsk` limitation
-where Claude can't read files outside the project directory.
+tool access for dropped text files. For PDFs and images, use the Open File…
+dialog — it returns a filesystem path, and Claude's `Read` tool handles those
+natively without the `dontAsk` limitation.
 
 ---
 
@@ -238,6 +268,10 @@ directory — dropped files from the user's desktop or home folder won't be
 accessible. Since desktop Loom apps control the prompt and tools list,
 `bypassPermissions` with an explicit `--tools` list is the right choice.
 
-If you need to read files the user drops, the better approach is to read
-them in the Bun process (via `FileReader` → RPC) and include the content
-directly in the prompt. See the [File Drag-and-Drop](#file-drag-and-drop) section.
+For **text files** the user drops, the better approach is to read them in the
+webview (via `FileReader.readAsText()` → RPC) and include the content directly
+in the prompt. For **PDFs and images**, use the native Open File… dialog
+(`Utils.openFileDialog()`) to get a real filesystem path, then let Claude's
+`Read` tool handle it with `bypassPermissions`. See the
+[File Drag-and-Drop](#file-drag-and-drop) and
+[Native File Dialogs](#native-file-dialogs) sections.
