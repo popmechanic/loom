@@ -202,7 +202,7 @@ The typed bridge between Bun and webview. Define a schema, register handlers on 
 - **Bun side**: `BrowserView.defineRPC<Schema>({ handlers: { requests: { ... } } })` — define request handlers, send messages via `rpc.sendProxy.*`
 - **Webview side**: `Electroview.defineRPC<Schema>({ handlers: { messages: { ... } } })` + `new Electroview({ rpc })` — receive messages via handlers, call requests on the Bun process. **Note:** `new Electroview<T>()` (generic-only form) crashes — must pass `{ rpc }`
 
-See `@references/rpc-schema-reference.md` for the full typed contract.
+See `references/rpc-schema-reference.md` for the full typed contract.
 
 ### Preload Scripts
 
@@ -273,7 +273,7 @@ import { ContextMenu } from "electrobun/bun";
 ## Next Steps
 
 With the project scaffolded and running:
-1. Define your RPC schema — see `@references/rpc-schema-reference.md`
+1. Define your RPC schema — see `references/rpc-schema-reference.md`
 2. Implement the Claude Manager in `src/bun/` — see the patterns in SKILL.md
 3. Build the UI in `src/mainview/`
 
