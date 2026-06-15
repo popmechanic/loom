@@ -28,6 +28,14 @@ The server is a thin relay. Claude does the work. Your interface gives it form.
 
 For a deeper walkthrough of the architecture, patterns, and design decisions, open the [interactive explainer](https://popmechanic.github.io/loom/explainer.html).
 
+## Skills
+
+This plugin ships three skills — Claude picks the right one from your request:
+
+- **loom** — deployed or multi-user web apps: a Node/Express server spawns `claude -p`, with per-user OAuth, rate limiting, and streaming to a browser UI.
+- **loom-local** — single-user local tools: a thin Bun (`Bun.serve()`) server that inherits your existing Claude Code login. No auth, no deployment.
+- **loom-desktop** — native macOS/Windows/Linux apps via ElectroBun (Bun + system webview) with typed RPC. No HTTP server.
+
 ## Installation
 
 Either:
