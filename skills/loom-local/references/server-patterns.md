@@ -96,6 +96,13 @@ handle multi-byte UTF-8 characters that split across chunk boundaries.
 Every pattern below assumes this baseline `Bun.serve()` setup. Define it once
 at the top of the server file, alongside the shared utilities.
 
+> **Loopback is not a security boundary.** Binding `127.0.0.1` keeps this off
+> the LAN, but any process or browser tab on this machine can still reach the
+> port — and this server runs `claude -p` with `Bash` and `dontAsk`, i.e.
+> arbitrary local command execution. Fine for a single-user local tool; if you
+> need a hard boundary, add an `Origin` check or a random per-launch token, and
+> never port-forward it.
+
 ```typescript
 import { resolve } from "path";
 const PORT = process.env.PORT !== undefined ? Number(process.env.PORT) : 3456;
@@ -498,6 +505,15 @@ Analyze multiple items concurrently, aggregate results.
 if (url.pathname === "/api/batch" && req.method === "POST") {
   const { items, task } = await req.json();
   const TIMEOUT_MS = 30000;
+  const MAX_ITEMS = 20;
+  const CONCURRENCY = 4;
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return new Response(JSON.stringify({ error: "items must be a non-empty array" }), { status: 400 });
+  }
+  if (items.length > MAX_ITEMS) {
+    return new Response(JSON.stringify({ error: `Too many items (max ${MAX_ITEMS})` }), { status: 400 });
+  }
 
   const schema = JSON.stringify({
     type: "object",
@@ -505,8 +521,8 @@ if (url.pathname === "/api/batch" && req.method === "POST") {
     required: ["analysis", "score"]
   });
 
-  const outcomes = await Promise.allSettled(
-    items.map((item: string) => new Promise<any>((resolve, reject) => {
+  function analyzeItem(item: string): Promise<any> {
+    return new Promise<any>((resolve, reject) => {
       const proc = Bun.spawn(["claude",
         "-p", "--model", "haiku", "--output-format", "json",
         "--permission-mode", "dontAsk",
@@ -537,13 +553,38 @@ if (url.pathname === "/api/batch" && req.method === "POST") {
           reject(e);
         }
       })();
-    }))
-  );
+    });
+  }
+
+  async function mapWithConcurrency<T, R>(
+    arr: T[],
+    limit: number,
+    fn: (item: T) => Promise<R>
+  ): Promise<PromiseSettledResult<R>[]> {
+    const results: PromiseSettledResult<R>[] = new Array(arr.length);
+    let nextIndex = 0;
+
+    async function worker() {
+      while (nextIndex < arr.length) {
+        const i = nextIndex++;
+        try {
+          results[i] = { status: "fulfilled", value: await fn(arr[i]) };
+        } catch (e: any) {
+          results[i] = { status: "rejected", reason: e };
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(limit, arr.length) }, worker));
+    return results;
+  }
+
+  const outcomes = await mapWithConcurrency(items, CONCURRENCY, analyzeItem);
 
   const results = outcomes.map((o, i) =>
     o.status === "fulfilled"
       ? { item: items[i], data: o.value }
-      : { item: items[i], error: o.reason.message }
+      : { item: items[i], error: (o as PromiseRejectedResult).reason.message }
   );
 
   return Response.json({ results });
