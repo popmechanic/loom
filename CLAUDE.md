@@ -41,7 +41,10 @@ skills/loom/
 
 **Writing style:** Use imperative form and explain consequences. Never use MUST/MUST NOT in all caps — if something is important, explain why.
 
-**Reference paths:** `loom` uses `references/foo.md`, `loom-desktop` uses `@references/foo.md` (the `@` prefix is a Claude Code convention for skill-relative paths). Be consistent within each skill.
+**Reference paths:** All skills use the plain relative form `references/foo.md`
+(the form shown in the official Claude Code skills docs). Do not use the
+`@references/` prefix — it is not part of the documented skill-reference syntax
+and was removed for consistency across the three skills.
 
 **Cross-references:** Every reference file citation in SKILL.md includes guidance on when to read it:
 ```markdown
