@@ -1,13 +1,14 @@
 ---
 name: loom-desktop
 description: >
-  Use when building a native desktop application that needs Claude Code CLI
-  (`claude -p`) as its runtime, using ElectroBun (Bun + system webview). The
-  Bun process spawns Claude directly via typed RPC — no HTTP server, no auth,
-  no SSE formatting. Triggers: "desktop app with Claude", "native Claude tool",
-  "ElectroBun Claude app", "local AI agent", "Claude on the dock", or any
-  desktop application needing Claude's agentic capabilities through a native
-  interface. NOT for web apps (use loom), direct Anthropic API, or chat
+  Build native desktop applications where Claude Code CLI (`claude -p`) is the
+  runtime, using ElectroBun (Bun + system webview) with typed RPC — no HTTP
+  server, no auth.
+when_to_use: >
+  Use when building a native macOS/Windows/Linux tool with drag-and-drop, file
+  dialogs, system tray, or desktop distribution. Triggers: "desktop app with
+  Claude", "native Claude tool", "ElectroBun Claude app", "Claude on the dock".
+  NOT for web apps (use loom / loom-local), direct Anthropic API, or chat
   replicas.
 ---
 
@@ -110,7 +111,7 @@ Web Loom uses Express + SSE because browsers need HTTP. Desktop Loom skips that:
 | Complexity | ~200 lines of plumbing | ~20 lines of plumbing |
 
 The typed RPC contract is defined once and shared between Bun and webview. See
-`@references/rpc-schema-reference.md` for the full schema.
+`references/rpc-schema-reference.md` for the full schema.
 
 ## Project Setup
 
@@ -127,9 +128,9 @@ This gives you a running app with a Bun process and webview. From here, you'll
 add the Claude Manager to the Bun side and the task UI to the webview.
 
 For the full setup guide — project structure, configuration, dev workflow — see
-`@references/electrobun-setup.md`.
+`references/electrobun-setup.md`.
 
-For Claude CLI flags and output formats, see `@references/cli-runtime-reference.md`.
+For Claude CLI flags and output formats, see `references/cli-runtime-reference.md`.
 
 ## The Conversation
 
@@ -220,7 +221,7 @@ Four helpers used by every pattern: `resolveClaudePath()` (find claude binary),
 `cleanEnv()` (remove nesting guards), `createStreamParser()` (buffer stdout
 into JSON lines), and `deriveAndSendRPC()` (map stream events to RPC messages).
 
-> See `@references/desktop-patterns.md#shared-utilities` for the full
+> See `references/desktop-patterns.md#shared-utilities` for the full
 > implementations with explanatory prose.
 
 ### Event Type Mapping
@@ -246,25 +247,25 @@ status heartbeats every 2 seconds.
 
 | Pattern | When to Use | Reference |
 |---------|-------------|-----------|
-| Synchronous | Quick extraction, classification | `@references/desktop-patterns.md#pattern-1-synchronous` |
-| Streaming | Primary pattern — tokens flow to UI | `@references/desktop-patterns.md#pattern-2-streaming` |
-| Conversational | Multi-turn with context retention | `@references/desktop-patterns.md#pattern-3-conversational` |
-| Background | Long tasks, tray minimization | `@references/desktop-patterns.md#pattern-4-background` |
+| Synchronous | Quick extraction, classification | `references/desktop-patterns.md#pattern-1-synchronous` |
+| Streaming | Primary pattern — tokens flow to UI | `references/desktop-patterns.md#pattern-2-streaming` |
+| Conversational | Multi-turn with context retention | `references/desktop-patterns.md#pattern-3-conversational` |
+| Background | Long tasks, tray minimization | `references/desktop-patterns.md#pattern-4-background` |
 
-> Read `@references/desktop-patterns.md` when implementing a specific
+> Read `references/desktop-patterns.md` when implementing a specific
 > interaction pattern — it has the complete Bun-side and webview-side code.
 
 ### Desktop Features
 
 | Feature | Description | Reference |
 |---------|-------------|-----------|
-| File Drag-and-Drop | Drop files for Claude to analyze (use FileReader, not File.path) | `@references/desktop-features.md#file-drag-and-drop` |
-| Native File Dialogs | Open/save files via Utils.openFileDialog() | `@references/desktop-features.md#native-file-dialogs` |
-| System Tray | Minimize during long tasks, show progress | `@references/desktop-features.md#system-tray` |
-| Native Menus | App menu bar with keyboard shortcuts | `@references/desktop-features.md#native-menus` |
-| File Access Config | Permission modes and tools lists for desktop | `@references/desktop-features.md#local-file-access-configuration` |
+| File Drag-and-Drop | Drop files for Claude to analyze (use FileReader, not File.path) | `references/desktop-features.md#file-drag-and-drop` |
+| Native File Dialogs | Open/save files via Utils.openFileDialog() | `references/desktop-features.md#native-file-dialogs` |
+| System Tray | Minimize during long tasks, show progress | `references/desktop-features.md#system-tray` |
+| Native Menus | App menu bar with keyboard shortcuts | `references/desktop-features.md#native-menus` |
+| File Access Config | Permission modes and tools lists for desktop | `references/desktop-features.md#local-file-access-configuration` |
 
-> Read `@references/desktop-features.md` when adding native platform features
+> Read `references/desktop-features.md` when adding native platform features
 > to your app.
 
 ### Distribution
@@ -274,7 +275,7 @@ never a ZIP (zipping strips executable permissions). Claude CLI is an external
 dependency — don't bundle it. For clean distribution without Gatekeeper warnings,
 set up code signing with an Apple Developer account.
 
-> Read `@references/distribution.md` for the complete build, signing, DMG icon,
+> Read `references/distribution.md` for the complete build, signing, DMG icon,
 > and auto-update setup.
 
 ### Gotchas
@@ -286,7 +287,7 @@ Critical issues from real-world development. These 4 bite everyone:
 - **#13 macOS PATH** — GUI apps don't inherit shell PATH. Use `resolveClaudePath()` at startup.
 - **#12 File.path** — Doesn't exist in system webviews. Use `FileReader.readAsText()` via RPC instead.
 
-The remaining 12 gotchas (numbers match `@references/gotchas.md`):
+The remaining 12 gotchas (numbers match `references/gotchas.md`):
 
 - #3 TextDecoder with `{ stream: true }` — prevents multi-byte UTF-8 corruption
 - #4 `dontAsk` blocks reads outside project dir — use `bypassPermissions` for desktop
@@ -301,7 +302,7 @@ The remaining 12 gotchas (numbers match `@references/gotchas.md`):
 - #15 No cross-compilation — build on the target platform
 - #16 Process crash recovery — retry transient failures with backoff
 
-> Read `@references/gotchas.md` for full explanations, code samples, and fixes
+> Read `references/gotchas.md` for full explanations, code samples, and fixes
 > for all 16 issues.
 
 ## What to Generate
