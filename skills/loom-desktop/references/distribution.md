@@ -107,6 +107,20 @@ Rez -append /tmp/icon.rsrc -o artifacts/stable-macos-arm64-*.dmg
 SetFile -a C artifacts/stable-macos-arm64-*.dmg
 ```
 
+**Xcode Dependency:** `Rez`, `DeRez`, and `SetFile` ship only with full Xcode
+and are deprecated. On a Command Line Tools-only machine or in CI, these tools
+silently no-op and the volume icon won't be set.
+
+For CI pipelines or CLT-only machines, use the `fileicon` tool instead (install
+via `brew install fileicon`):
+
+```bash
+iconutil -c icns icon.iconset -o icon.icns
+fileicon set artifacts/stable-macos-arm64-*.dmg icon.icns
+```
+
+Or set the volume icon during DMG creation using a tool like `create-dmg`.
+
 ---
 
 ## Code Signing and Notarization

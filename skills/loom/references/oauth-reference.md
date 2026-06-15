@@ -72,6 +72,11 @@ sends its SHA-256 hash (`code_challenge`) with the authorization request.
 When exchanging the code for tokens, the server proves it initiated the
 request by providing the original verifier. Anthropic's OAuth requires PKCE.
 
+PKCE alone does not tie the authorization request to the user's browser
+session. An `oauth_state` cookie is set at `/api/oauth/start` and verified
+at `/api/oauth/exchange` to provide CSRF protection — ensuring that only the
+browser that initiated the flow can complete it.
+
 ---
 
 ## Constants
@@ -148,26 +153,36 @@ app.get("/api/oauth/start", (req, res) => {
   }).toString();
 
   pendingPKCE.set(state, { verifier, createdAt: Date.now() });
+  res.cookie("oauth_state", state, { httpOnly: true, sameSite: "lax", secure: true, maxAge: 600000 });
   res.json({ authUrl, state });
 });
 ```
 
 ### `POST /api/oauth/exchange`
 
-Exchanges an authorization code for tokens using the stored PKCE verifier,
-then fetches the user's profile so the frontend can display their identity.
+Exchanges an authorization code for tokens using the stored PKCE verifier.
+Optionally attempts a best-effort profile fetch so the frontend can display
+identity — but the profile endpoint may be unavailable for consumer OAuth
+tokens, so the frontend must fall back gracefully.
 
+- Validates CSRF: `req.cookies.oauth_state` must equal `req.body.state` (returns 400 otherwise)
 - Validates state exists in pendingPKCE map (returns 400 if expired/missing)
 - Strips `#state` suffix from code (handles callback URL fragments)
 - POSTs to Anthropic's token endpoint with the code, verifier, and other params
-- Fetches user profile from `https://api.anthropic.com/v1/me` using the new access token
-- On success, creates an in-memory session (with profile) and sets an httpOnly cookie
+- Attempts a best-effort profile fetch from `https://api.anthropic.com/v1/me` (requires `anthropic-beta: oauth-2025-04-20` header); silently skips if it fails or is unavailable
+- On success, creates an in-memory session (with profile if available) and sets an httpOnly cookie
 - Returns `{ok: true}` to the frontend
 
 ```typescript
 app.post("/api/oauth/exchange", async (req, res) => {
   const { code, state } = req.body;
   if (!code || !state) return res.status(400).json({ error: "code and state required" });
+
+  // CSRF check: the state must match the cookie set at /api/oauth/start
+  if (req.cookies.oauth_state !== state) {
+    return res.status(400).json({ error: "State mismatch (CSRF check failed)" });
+  }
+  res.clearCookie("oauth_state");
 
   const pending = pendingPKCE.get(state);
   if (!pending) return res.status(400).json({ error: "Invalid or expired state" });
@@ -197,15 +212,19 @@ app.post("/api/oauth/exchange", async (req, res) => {
 
     const tokens: any = await resp.json();
 
-    // Fetch user profile so the frontend can show who's logged in
+    // Best-effort profile fetch — the /v1/me endpoint may not be available for
+    // all consumer OAuth token types. If it fails, the frontend falls back to
+    // a generic "CONNECTED" label. Do not treat this as a fatal error.
     let profile: { name?: string; email?: string } | undefined;
     try {
       const profileResp = await fetch("https://api.anthropic.com/v1/me", {
-        headers: { Authorization: `Bearer ${tokens.access_token}` },
+        headers: { Authorization: `Bearer ${tokens.access_token}`, "anthropic-beta": "oauth-2025-04-20" },
       });
       if (profileResp.ok) {
         const p: any = await profileResp.json();
         profile = { name: p.name, email: p.email };
+      } else {
+        console.warn(`[oauth] Profile fetch returned ${profileResp.status} — may be unavailable for this token type`);
       }
     } catch (e: any) {
       console.warn(`[oauth] Profile fetch error:`, e?.message);
@@ -321,6 +340,8 @@ app.get("/api/health", (req, res) => {
   const sessionId = req.cookies?.[SESSION_COOKIE_NAME];
   const session = sessionId ? sessions.get(sessionId) : null;
   res.json({ needsSetup: !session, user: session?.profile ?? null });
+  // user may be null if the profile fetch was unavailable — frontend should
+  // display a generic "CONNECTED" label rather than relying on name/email.
 });
 
 app.post("/api/logout", (req, res) => {
@@ -330,6 +351,21 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 ```
+
+### Profile Display (Frontend)
+
+The `/api/health` response includes `user: { name, email } | null`. The profile
+is best-effort — `user` is `null` when the profile endpoint was unavailable or
+returned an error. The frontend must handle this gracefully:
+
+```javascript
+// Example: display identity or fall back to "CONNECTED"
+const { needsSetup, user } = await fetch("/api/health").then(r => r.json());
+const label = user?.name ?? user?.email ?? "CONNECTED";
+```
+
+Never assume `user` is non-null. A null profile does not mean authentication
+failed — it only means the identity fetch was not available for this token type.
 
 ---
 

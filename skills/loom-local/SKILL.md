@@ -1,14 +1,15 @@
 ---
 name: loom-local
 description: >
-  Use when building a local web application that needs Claude Code CLI
-  (`claude -p`) as its runtime, using Bun as the server layer. The Bun server
-  spawns Claude processes and streams results to the browser — no authentication,
-  no deployment, no multi-tenancy. Triggers: "local Claude app", "Bun server
-  with Claude", "claude -p web app", "local Claude-powered tool", "build a
-  local app that uses Claude", or any local web app needing Claude's agentic
-  capabilities through a browser interface. NOT for deployed/multi-user apps
-  (use loom), desktop apps (use loom-desktop), or direct Anthropic API usage.
+  Build local web applications where Claude Code CLI (`claude -p`) is the
+  runtime, using Bun (`Bun.serve()`) as a thin server that streams results to
+  a browser. No auth, no deployment — the machine's existing Claude Code login
+  is inherited.
+when_to_use: >
+  Use when building a single-user local tool that runs only on the developer's
+  machine. Triggers: "local Claude app", "Bun server with Claude", "claude -p
+  web app", "local Claude-powered tool". NOT for deployed/multi-user apps (use
+  loom), desktop apps (use loom-desktop), or direct Anthropic API usage.
 ---
 
 # Loom Local: Applications on the Claude Code Runtime (Bun)
@@ -215,7 +216,9 @@ Claude emits newline-delimited JSON events:
 | `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error}` | Yes (done signal) |
 
 **Max-turns detection:** The `result` event has `subtype: "error_max_turns"`
-with `is_error: false`. Check `subtype` — easy to miss because `is_error` is false.
+with `is_error: true` (verified on CLI v2.1.x). Check `subtype` **before**
+`is_error` — otherwise the generic `is_error` branch catches max-turns and the
+"incomplete" branch never runs.
 
 **Extended thinking models** work correctly. Thinking tokens have
 `delta.thinking` instead of `delta.text` — the `event?.delta?.text` check
@@ -247,7 +250,7 @@ These are silent-failure modes — things that break with NO error message:
 - [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
 - [ ] `cleanEnv()` is called on every `Bun.spawn`/`Bun.spawnSync` — without it, Claude refuses to start inside a Claude Code session
 - [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
-- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: false`, so unchecked it looks like success
+- [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: true` (verified on CLI v2.1.x); check `subtype` **before** `is_error` or the generic error branch swallows it
 - [ ] Request body is parsed with `await req.json()` before accessing fields — without it, the spawn gets an empty prompt
 - [ ] `stdout` chunks are buffered into complete JSON lines before parsing — TCP delivers arbitrary chunk boundaries
 

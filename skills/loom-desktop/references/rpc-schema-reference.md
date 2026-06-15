@@ -26,11 +26,11 @@ type LoomRPC = {
         params: {
           prompt: string;
           model?: string;
-          tools?: string[];
+          tools: string[];  // Required: with bypassPermissions you must pass an explicit, minimal allowlist.
           maxBudget?: number;
           sessionId?: string;  // For conversational pattern
         };
-        response: { taskId: string };
+        response: { taskId: string; sessionId: string };
       };
       abort: {
         params: { taskId: string };
@@ -87,9 +87,10 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
     requests: {
       startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
         const taskId = crypto.randomUUID();
+        const resolvedSessionId = sessionId ?? crypto.randomUUID();
         // Spawn claude -p (see SKILL.md patterns)
-        spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId });
-        return { taskId };
+        spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId: resolvedSessionId });
+        return { taskId, sessionId: resolvedSessionId };
       },
       abort: async ({ taskId }) => {
         const success = abortTask(taskId);
@@ -182,12 +183,13 @@ Requests return promises:
 
 ```typescript
 // Start a task
-const { taskId } = await electrobun.rpc.request.startTask({
+const { taskId, sessionId } = await electrobun.rpc.request.startTask({
   prompt: "Analyze all TypeScript files in src/",
   model: "sonnet",
   tools: ["Read", "Glob", "Grep"],
   maxBudget: 1,
 });
+// sessionId is returned so you can pass it on follow-up turns for multi-turn conversations
 
 // Abort a task
 const { success } = await electrobun.rpc.request.abort({ taskId });
@@ -250,6 +252,7 @@ function App() {
   const [output, setOutput] = useState("");
   const [status, setStatus] = useState<string>("idle");
   const [taskId, setTaskId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     callbacks.onToken = ({ text }) => setOutput((prev) => prev + text);
@@ -269,11 +272,12 @@ function App() {
   async function runTask() {
     setOutput("");
     setStatus("spawning");
-    const { taskId } = await electrobun.rpc.request.startTask({
+    const { taskId, sessionId } = await electrobun.rpc.request.startTask({
       prompt: "Analyze the codebase",
       tools: ["Read", "Glob", "Grep"],
     });
     setTaskId(taskId);
+    setSessionId(sessionId);
   }
 
   async function abort() {
@@ -299,7 +303,7 @@ function App() {
 Webview                        Bun                          claude -p
   │                             │                              │
   │─── startTask(prompt) ─────►│                              │
-  │◄── { taskId } ─────────────│                              │
+  │◄── { taskId, sessionId } ──│                              │
   │                             │── Bun.spawn("claude"...) ──►│
   │                             │                              │
   │◄── status(spawning) ───────│                              │
@@ -321,13 +325,13 @@ Webview                        Bun                          claude -p
 Webview                        Bun
   │                             │
   │─── startTask(prompt) ─────►│   // First turn, no sessionId
-  │◄── { taskId } ─────────────│   // Bun generates sessionId internally
+  │◄── { taskId, sessionId } ──│   // Bun generates and returns sessionId
   │◄── ...tokens... ───────────│
   │◄── done ────────────────────│
   │                             │
-  │─── startTask(prompt, ──────►│   // Follow-up, with sessionId
+  │─── startTask(prompt, ──────►│   // Follow-up, pass returned sessionId
   │     sessionId) ─────────────│   // Bun spawns with --resume <id>
-  │◄── { taskId } ─────────────│
+  │◄── { taskId, sessionId } ──│
   │◄── ...tokens... ───────────│
   │◄── done ────────────────────│
 ```
@@ -338,7 +342,7 @@ Webview                        Bun
 Webview                        Bun                          claude -p
   │                             │                              │
   │─── startTask(prompt) ─────►│── spawn ────────────────────►│
-  │◄── { taskId } ─────────────│                              │
+  │◄── { taskId, sessionId } ──│                              │
   │◄── ...tokens... ───────────│◄── ...stream events... ─────│
   │                             │                              │
   │─── abort(taskId) ──────────►│── SIGTERM ──────────────────►│

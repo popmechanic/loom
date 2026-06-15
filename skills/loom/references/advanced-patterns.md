@@ -53,10 +53,7 @@ async function extract<T>(prompt: string, schema: object, session: UserSession, 
     if (wrapper.is_error) throw new Error(wrapper.result);
     if (wrapper.structured_output) return wrapper.structured_output as T;
     try { return JSON.parse(wrapper.result) as T; } catch {
-      // result is not JSON — return the wrapper itself as a last resort.
-      // This handles edge cases where structured_output is absent but
-      // the operation succeeded with a plain-text result.
-      return wrapper as T;
+      throw new Error("Claude returned no structured_output and result was not valid JSON");
     }
   } finally {
     clearTimeout(timer);
@@ -75,11 +72,13 @@ session serialization overhead. The tradeoff is lifecycle management.
 ```typescript
 import { spawn, ChildProcess } from "child_process";
 
-let proc: ChildProcess | null = null;
-let sessionActive = false;
-let lastActivity = Date.now();
+// Map<sessionId, { proc, lastActivity }> — one entry per user session.
+// Never share a proc across sessions: each user's CLAUDE_CODE_OAUTH_TOKEN is
+// injected at spawn time, so a shared proc would run all requests under
+// whichever user started it first.
+const sessions = new Map<string, { proc: ChildProcess; lastActivity: number }>();
 
-function startSession(session: UserSession, systemPrompt?: string) {
+function buildArgs(systemPrompt?: string): string[] {
   const args = [
     "-p",
     "--input-format", "stream-json",
@@ -89,56 +88,71 @@ function startSession(session: UserSession, systemPrompt?: string) {
     "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
   ];
   if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
-
-  proc = spawn("claude", args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: spawnEnvForUser(session),
-  });
-  sessionActive = true;
-
-  const parse = createStreamParser((event) => {
-    if (event.type === "stream_event" && event.event?.delta?.text) {
-      broadcast({ type: "token", text: event.event.delta.text });
-    } else if (event.type === "assistant" && event.message?.content) {
-      for (const block of event.message.content) {
-        if (block.type === "tool_use") {
-          broadcast({ type: "tool", name: block.name, input: block.input });
-        }
-      }
-    } else if (event.type === "result") {
-      if (event.is_error) {
-        broadcast({ type: "error", message: event.result });
-      } else if (event.subtype === "error_max_turns") {
-        broadcast({ type: "warning", message: "Task incomplete — reached turn limit" });
-      } else {
-        broadcast({ type: "done" });
-      }
-    }
-  });
-  proc.stdout!.on("data", parse);
-  proc.stderr!.on("data", (chunk) => console.error(`[claude] ${chunk}`));
-  proc.on("close", () => { sessionActive = false; proc = null; });
+  return args;
 }
 
-function sendMessage(text: string): boolean {
-  if (!proc || !sessionActive) return false;
+function getOrStart(session: UserSession, systemPrompt?: string): { proc: ChildProcess; lastActivity: number } {
+  let s = sessions.get(session.id);
+  if (!s || s.proc.exitCode !== null) {
+    const proc = spawn("claude", buildArgs(systemPrompt), {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: spawnEnvForUser(session),
+    });
+    s = { proc, lastActivity: Date.now() };
+    sessions.set(session.id, s);
+
+    const parse = createStreamParser((event) => {
+      if (event.type === "stream_event" && event.event?.delta?.text) {
+        broadcast(session.id, { type: "token", text: event.event.delta.text });
+      } else if (event.type === "assistant" && event.message?.content) {
+        for (const block of event.message.content) {
+          if (block.type === "tool_use") {
+            broadcast(session.id, { type: "tool", name: block.name, input: block.input });
+          }
+        }
+      } else if (event.type === "result") {
+        if (event.subtype === "error_max_turns") {
+          broadcast(session.id, { type: "warning", message: "Task incomplete — reached turn limit" });
+        } else if (event.is_error) {
+          broadcast(session.id, { type: "error", message: event.result });
+        } else {
+          broadcast(session.id, { type: "done" });
+        }
+      }
+    });
+    proc.stdout!.on("data", parse);
+    proc.stderr!.on("data", (chunk) => console.error(`[claude:${session.id}] ${chunk}`));
+    proc.on("close", () => { sessions.delete(session.id); });
+  }
+  return s;
+}
+
+function sendMessage(session: UserSession, text: string): boolean {
+  const s = sessions.get(session.id);
+  if (!s || s.proc.exitCode !== null) return false;
   const jsonl = JSON.stringify({
     type: "user",
     message: { role: "user", content: [{ type: "text", text }] },
   }) + "\n";
-  proc.stdin!.write(jsonl);
-  lastActivity = Date.now();
+  s.proc.stdin!.on("error", () => {});
+  s.proc.stdin!.write(jsonl);
+  s.lastActivity = Date.now();
   return true;
 }
 
-function endSession() {
-  if (proc) proc.kill();
+function endSession(session: UserSession) {
+  const s = sessions.get(session.id);
+  if (s) { s.proc.kill(); sessions.delete(session.id); }
 }
 
 // Inactivity timeout — kill idle sessions after 15 minutes
 setInterval(() => {
-  if (sessionActive && Date.now() - lastActivity > 15 * 60 * 1000) {
-    endSession();
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (now - s.lastActivity > 15 * 60 * 1000) {
+      s.proc.kill();
+      sessions.delete(id);
+    }
   }
 }, 60000);
 ```
@@ -148,6 +162,8 @@ Key differences from the per-request patterns:
 - Stdin stays open — messages are newline-delimited JSON, not piped and closed
 - `--append-system-prompt` injects persona/constraints without replacing base prompt
 - Lifecycle management required: start, stop, inactivity timeout
+- `getOrStart` is lazy — call it before `sendMessage` to ensure the process exists
+- Each session gets its own spawned process with its own `CLAUDE_CODE_OAUTH_TOKEN`; never share a process across users
 
 ---
 
