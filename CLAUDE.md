@@ -66,7 +66,7 @@ The `loom-workspace/evals/evals.json` file contains test prompts from previous e
 
 ## Plugin Versioning
 
-Bump the version in `.claude-plugin/plugin.json` when publishing changes. Current: `0.0.4`.
+Bump the version in `.claude-plugin/plugin.json` when publishing changes. Current: `0.0.5`.
 
 ## Important Distinction
 

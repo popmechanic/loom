@@ -23,7 +23,7 @@ which returns a real filesystem path that Claude's `Read` tool handles natively
 
 **Why text-only?** `File.path` is an Electron-specific extension — it does NOT
 exist in WKWebView (macOS), WebView2 (Windows), or WebKit2GTK (Linux). System
-webviews can't expose a dropped file's real path (gotcha #12 in `desktop-patterns.md`),
+webviews can't expose a dropped file's real path (gotcha #12 in `references/gotchas.md`),
 so the only in-webview option is `FileReader.readAsText()`, which only works
 for text. For binary files the correct path is: native dialog → filesystem path
 → Claude's `Read` tool.

@@ -268,7 +268,7 @@ function deriveAndSendRPC(
       } else if (event.is_error) {
         rpc.sendProxy.error({ taskId, message: event.result ?? "Claude reported an error" });
       } else {
-        rpc.sendProxy.done({ taskId, cost: event.total_cost_usd });
+        rpc.sendProxy.done({ taskId, cost: event.total_cost_usd, duration: event.duration_ms ?? 0 });
       }
       currentState = "idle";
       break;
