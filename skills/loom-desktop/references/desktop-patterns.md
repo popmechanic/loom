@@ -317,6 +317,9 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
             "--max-budget-usd", String(maxBudget || 1),
             "--json-schema", schema,
             "--no-session-persistence",
+            // Explicit allowlist — bypassPermissions with no --tools grants ALL
+            // tools on the whole filesystem. Honor the caller's allowlist.
+            "--tools", (tools && tools.length ? tools.join(",") : "Read,Grep"),
             prompt,
           ], { env: cleanEnv(), timeout: 60000 });
 
