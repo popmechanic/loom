@@ -119,7 +119,7 @@ Scaffold an ElectroBun project:
 
 ```bash
 bunx electrobun init hello-world
-cd myapp
+cd hello-world
 bun install
 bunx electrobun dev
 ```
