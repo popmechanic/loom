@@ -15,6 +15,7 @@ Complete Bun-side and webview-side code patterns for Loom desktop apps. Read thi
   - [Bun-side: Request Handlers](#bun-side-request-handlers)
   - [Webview-side: Receiving Messages](#webview-side-receiving-messages)
   - [Startup CLI Check](#startup-cli-check)
+  - [Shutdown: Kill In-Flight Processes](#shutdown-kill-in-flight-processes)
 - [Pattern 3: Conversational](#pattern-3-conversational)
   - [Session Management](#session-management)
   - [Conversational Request Handler](#conversational-request-handler)
@@ -42,6 +43,8 @@ in dev (launched from terminal) but fails when distributed and opened from
 Finder. Always include this and use `CLAUDE_BIN` in all `Bun.spawn()` calls.
 
 ```typescript
+import { accessSync, constants } from "fs";
+
 function resolveClaudePath(): string {
   // Try interactive login shell (sources both .zprofile AND .zshrc)
   for (const flags of ["-lic", "-lc", "-ic"]) {
@@ -67,9 +70,12 @@ function resolveClaudePath(): string {
   ];
 
   for (const p of candidates) {
+    // Check the file exists AND is executable. `Bun.file(p).size` is 0 for a
+    // missing file (so it never matches) and ignores the exec bit entirely —
+    // accessSync with X_OK is the correct existence-and-executable test.
     try {
-      const file = Bun.file(p);
-      if (file.size > 0) return p;
+      accessSync(p, constants.X_OK);
+      return p;
     } catch {}
   }
 
@@ -157,7 +163,16 @@ It also tracks state for the heartbeat system.
 ```typescript
 // State for heartbeat
 let currentState: "spawning" | "running" | "thinking" | "tool_use" | "idle" = "spawning";
-let lastToolName = "";
+// Correlate tool results to the tool that produced them by tool_use_id, NOT a
+// single mutable "last tool" — parallel tool calls would otherwise all be
+// attributed to whichever tool_use arrived last.
+const toolNamesById = new Map<string, string>();
+// Track whether text for the current assistant message already streamed in as
+// stream_event deltas. Non-thinking models emit text BOTH as deltas and as a
+// final aggregated `assistant` text block (double emission). Thinking models
+// emit text only in the `assistant` block. Forward the block's text only when
+// no deltas were seen for this message.
+let sawDeltaThisMessage = false;
 let lastOutputTime = Date.now();
 
 function deriveAndSendRPC(
@@ -177,25 +192,49 @@ function deriveAndSendRPC(
       if (!msg?.content) break;
       for (const block of msg.content) {
         if (block.type === "text") {
-          rpc.sendProxy.token({ taskId, text: block.text });
+          // Only forward when no streaming deltas already carried this text —
+          // covers thinking models, which skip deltas.
+          if (!sawDeltaThisMessage) {
+            rpc.sendProxy.token({ taskId, text: block.text });
+          }
           currentState = "running";
         } else if (block.type === "tool_use") {
           rpc.sendProxy.toolUse({ taskId, tool: block.name, input: block.input });
           currentState = "tool_use";
-          lastToolName = block.name;
+          toolNamesById.set(block.id, block.name);
+        } else if (block.type === "thinking") {
+          // Thinking block with no visible text yet — surface the thinking state.
+          if (currentState === "running" || currentState === "spawning") {
+            currentState = "thinking";
+          }
         }
       }
+      // Assistant message complete — reset for the next message boundary.
+      sawDeltaThisMessage = false;
       break;
     }
 
     case "stream_event": {
-      const delta = event.event?.delta;
+      const inner = event.event;
+      // New assistant message starting — reset the per-message delta flag.
+      if (inner?.type === "message_start") {
+        sawDeltaThisMessage = false;
+        break;
+      }
+      const delta = inner?.delta;
+      if (delta?.type === "thinking_delta") {
+        // Model is reasoning but hasn't produced visible text yet.
+        currentState = "thinking";
+        break;
+      }
       if (delta?.text) {
         rpc.sendProxy.token({ taskId, text: delta.text });
+        sawDeltaThisMessage = true;
+        // Visible text began — leave the thinking state.
         currentState = "running";
       }
       if (delta?.type === "input_json_delta") {
-        // Tool input streaming — ignore, wait for full assistant message
+        // Tool input streaming — ignore, wait for full assistant message.
       }
       break;
     }
@@ -207,9 +246,12 @@ function deriveAndSendRPC(
         : Array.isArray(content)
           ? content.map((b: any) => b.text ?? "").join("")
           : JSON.stringify(content);
+      // tool_result carries the tool_use_id of the call it answers — look the
+      // tool name up by that id so parallel calls attribute correctly.
+      const toolUseId = event.tool_use_id ?? event.message?.tool_use_id;
       rpc.sendProxy.toolResult({
         taskId,
-        tool: lastToolName,
+        tool: toolNamesById.get(toolUseId) ?? "",
         output: text.slice(0, 10000),
         isError: !!event.is_error,
       });
@@ -280,7 +322,13 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
           }
 
           const parsed = JSON.parse(proc.stdout.toString());
-          if (parsed.is_error) {
+          // Check the budget/turn cap subtype BEFORE the generic is_error flag:
+          // on error_max_turns the `result` field is often empty, so the
+          // is_error branch would surface a blank message. Naming the cause is
+          // far more useful than an empty error.
+          if (parsed.subtype === "error_max_turns") {
+            rpc.sendProxy.error({ taskId, message: "Stopped: reached the max-turns / budget limit." });
+          } else if (parsed.is_error) {
             rpc.sendProxy.error({ taskId, message: parsed.result });
           } else {
             rpc.sendProxy.token({ taskId, text: parsed.result });
@@ -328,10 +376,14 @@ The complete `spawnClaude()` function. This is the heart of the bridge:
 import { BrowserView } from "electrobun/bun";
 
 // Active tasks for abort support
-const activeTasks = new Map<string, {
+type ActiveTask = {
   proc: ReturnType<typeof Bun.spawn>;
   heartbeat: ReturnType<typeof setInterval>;
-}>();
+  // Set by the abort handler so the stdout pump's exit check knows the non-zero
+  // SIGTERM exit was intentional and skips emitting a second error.
+  userAborted: boolean;
+};
+const activeTasks = new Map<string, ActiveTask>();
 
 function spawnClaude(
   taskId: string,
@@ -347,7 +399,15 @@ function spawnClaude(
 ) {
   // Heartbeat state
   let currentState: LoomRPC["webview"]["messages"]["status"]["state"] = "spawning";
-  let lastToolName = "";
+  // Map tool_use_id -> tool name so parallel tool calls attribute correctly
+  // (a single mutable "last tool" would mislabel concurrent results).
+  const toolNamesById = new Map<string, string>();
+  // Track whether the current assistant message already streamed text as
+  // stream_event deltas, so the final aggregated `assistant` text block isn't
+  // emitted a second time (non-thinking models emit both; thinking models emit
+  // only the block).
+  let sawDeltaThisMessage = false;
+  let lastToolName = "";  // last tool started — used for the heartbeat detail
   let lastOutputTime = Date.now();
   const startTime = Date.now();
 
@@ -393,7 +453,8 @@ function spawnClaude(
   }, 2000);
 
   // Track for abort
-  activeTasks.set(taskId, { proc, heartbeat });
+  const task: ActiveTask = { proc, heartbeat, userAborted: false };
+  activeTasks.set(taskId, task);
 
   // Collect stderr proactively — ReadableStream can only be consumed once.
   // If you read proc.stderr in an error handler after already consuming it
@@ -425,21 +486,46 @@ function spawnClaude(
         if (!msg?.content) break;
         for (const block of msg.content) {
           if (block.type === "text") {
-            rpc.sendProxy.token({ taskId, text: block.text });
+            // Skip if deltas already streamed this text; still emit for thinking
+            // models, which produce no deltas.
+            if (!sawDeltaThisMessage) {
+              rpc.sendProxy.token({ taskId, text: block.text });
+            }
             currentState = "running";
           } else if (block.type === "tool_use") {
             rpc.sendProxy.toolUse({ taskId, tool: block.name, input: block.input });
             currentState = "tool_use";
             lastToolName = block.name;
+            toolNamesById.set(block.id, block.name);
+          } else if (block.type === "thinking") {
+            // Reasoning with no visible text yet — surface the thinking state.
+            if (currentState === "running" || currentState === "spawning") {
+              currentState = "thinking";
+            }
           }
         }
+        // Message complete — reset for the next message boundary.
+        sawDeltaThisMessage = false;
         break;
       }
 
       case "stream_event": {
-        const delta = event.event?.delta;
+        const inner = event.event;
+        // New assistant message starting — reset the per-message delta flag.
+        if (inner?.type === "message_start") {
+          sawDeltaThisMessage = false;
+          break;
+        }
+        const delta = inner?.delta;
+        if (delta?.type === "thinking_delta") {
+          // Model is reasoning; no visible text yet.
+          currentState = "thinking";
+          break;
+        }
         if (delta?.text) {
           rpc.sendProxy.token({ taskId, text: delta.text });
+          sawDeltaThisMessage = true;
+          // Visible text began — leave the thinking state.
           currentState = "running";
         }
         break;
@@ -452,9 +538,12 @@ function spawnClaude(
           : Array.isArray(content)
             ? content.map((b: any) => b.text ?? "").join("")
             : JSON.stringify(content);
+        // Look the tool up by the tool_use_id this result answers, so parallel
+        // tool calls don't all attribute to the last-started tool.
+        const toolUseId = event.tool_use_id ?? event.message?.tool_use_id;
         rpc.sendProxy.toolResult({
           taskId,
-          tool: lastToolName,
+          tool: toolNamesById.get(toolUseId) ?? "",
           output: text.slice(0, 10000),
           isError: !!event.is_error,
         });
@@ -492,9 +581,11 @@ function spawnClaude(
       // Reader closed — process exited
     }
 
-    // Process finished — check for errors
+    // Process finished — check for errors. Skip when the user aborted: the
+    // abort handler already emitted the user-facing message, and SIGTERM makes
+    // the process exit non-zero, which would otherwise fire a second error.
     const exitCode = await proc.exited;
-    if (exitCode !== 0 && currentState !== "idle") {
+    if (exitCode !== 0 && currentState !== "idle" && !task.userAborted) {
       const stderr = stderrChunks.join("");
       rpc.sendProxy.error({
         taskId,
@@ -518,13 +609,17 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
     requests: {
       startTask: async ({ prompt, model, tools, maxBudget, sessionId }) => {
         const taskId = crypto.randomUUID();
-        spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId }, rpc);
-        return { taskId };
+        const resolvedSessionId = sessionId ?? crypto.randomUUID();
+        spawnClaude(taskId, prompt, { model, tools, maxBudget, sessionId: resolvedSessionId }, rpc);
+        return { taskId, sessionId: resolvedSessionId };
       },
       abort: async ({ taskId }) => {
         const task = activeTasks.get(taskId);
         if (!task) return { success: false };
 
+        // Mark the abort BEFORE killing so the pump's exit check treats the
+        // non-zero SIGTERM exit as intentional and suppresses a second error.
+        task.userAborted = true;
         task.proc.kill("SIGTERM");
         clearInterval(task.heartbeat);
         activeTasks.delete(taskId);
@@ -692,6 +787,37 @@ const win = new BrowserWindow({
 If Claude isn't found, show a setup screen with install instructions. Don't
 silently fail — the user needs to know why the app isn't working.
 
+### Shutdown: Kill In-Flight Processes
+
+`claude -p` children don't die just because the window closed. An orphaned
+process keeps running — and keeps spending your `--max-budget-usd` — until it
+finishes on its own. Add a shutdown hook on window `close` / app `before-quit`
+that terminates every active process and clears its heartbeat.
+
+```typescript
+function killAllTasks() {
+  // Covers Pattern 2/3 (activeTasks) and Pattern 4 (taskRegistry). Iterate a
+  // snapshot — kill/cleanup may delete entries as it runs.
+  for (const [taskId, task] of [...activeTasks]) {
+    try { task.proc.kill("SIGTERM"); } catch {}
+    clearInterval(task.heartbeat);
+    activeTasks.delete(taskId);
+  }
+  // If you use Pattern 4's background registry, drain it too:
+  // for (const [taskId, record] of [...taskRegistry]) {
+  //   try { record.proc.kill("SIGTERM"); } catch {}
+  //   clearInterval(record.heartbeat);
+  //   taskRegistry.delete(taskId);
+  // }
+}
+
+win.on("close", killAllTasks);
+app.on("before-quit", killAllTasks);
+```
+
+Without this, closing the window leaves zombie `claude -p` processes draining
+budget in the background with no UI to report or abort them.
+
 ---
 
 ## Pattern 3: Conversational
@@ -760,11 +886,17 @@ const rpc = BrowserView.defineRPC<LoomRPC>({
           isFirstTurn,
         }, rpc);
 
-        return { taskId };
+        // Return the internally-generated session id so the UI can pass it back
+        // on follow-up turns. Don't make the UI guess — taskId is per-request and
+        // is NOT the session id.
+        return { taskId, sessionId: actualSessionId };
       },
       abort: async ({ taskId }) => {
         const task = activeTasks.get(taskId);
         if (!task) return { success: false };
+        // Mark the abort before killing so the pump suppresses the duplicate
+        // SIGTERM-exit error (see Pattern 2).
+        task.userAborted = true;
         task.proc.kill("SIGTERM");
         clearInterval(task.heartbeat);
         activeTasks.delete(taskId);
@@ -857,7 +989,7 @@ function ChatApp() {
 
     setMessages((prev) => [...prev, { role: "user", content: prompt }]);
 
-    const { taskId } = await electrobun.rpc.request.startTask({
+    const resp = await electrobun.rpc.request.startTask({
       prompt,
       model: "sonnet",
       tools: ["Read", "Glob", "Grep", "Bash"],
@@ -865,8 +997,10 @@ function ChatApp() {
       sessionId: sessionId ?? undefined,
     });
 
-    // After first turn, store session ID for follow-ups
-    if (!sessionId) setSessionId(taskId); // Use taskId as proxy, or track via RPC
+    // Store the session id Bun returned so follow-up turns resume the same
+    // conversation. Bun returns the same id on every turn, so storing it
+    // again is harmless.
+    setSessionId(resp.sessionId);
   }
 
   return (
