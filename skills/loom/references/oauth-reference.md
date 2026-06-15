@@ -153,7 +153,11 @@ app.get("/api/oauth/start", (req, res) => {
   }).toString();
 
   pendingPKCE.set(state, { verifier, createdAt: Date.now() });
-  res.cookie("oauth_state", state, { httpOnly: true, sameSite: "lax", secure: true, maxAge: 600000 });
+  // secure in production; off for plain-http localhost dev. Browsers treat
+  // http://localhost as a secure context, so a Secure cookie still works in
+  // dev either way — the gate matters for non-localhost plain-HTTP.
+  const cookieSecure = process.env.NODE_ENV === "production";
+  res.cookie("oauth_state", state, { httpOnly: true, sameSite: "lax", secure: cookieSecure, maxAge: 600000 });
   res.json({ authUrl, state });
 });
 ```
@@ -243,6 +247,9 @@ app.post("/api/oauth/exchange", async (req, res) => {
     res.cookie(SESSION_COOKIE_NAME, sessionId, {
       httpOnly: true,
       sameSite: "lax",
+      // Same policy as the oauth_state cookie above: secure in production,
+      // off for plain-http localhost dev (localhost is a secure context).
+      secure: process.env.NODE_ENV === "production",
       maxAge: SESSION_MAX_AGE_MS,
       path: "/",
     });
@@ -280,15 +287,27 @@ Proactively refreshes the access token if it expires within 30 minutes.
 Call before spawning Claude subprocesses to prevent mid-session auth failures.
 Operates on the session object in memory — no file I/O.
 
+It **throws if the refresh fails** (so callers can return 401 instead of
+silently spawning with a dead token) and **coalesces concurrent refreshes**:
+refresh tokens rotate, so two parallel refreshes would each consume the token
+and clobber each other. One in-flight refresh is shared per session object.
+
 **Important:** The refresh token rotates on every refresh — the new tokens
 are stored directly in the session object.
 
 ```typescript
-async function refreshSessionIfNeeded(session: UserSession): Promise<boolean> {
-  const thirtyMinutes = 30 * 60 * 1000;
-  if (session.expiresAt > Date.now() + thirtyMinutes) return false;
+// One in-flight refresh per session object. Refresh tokens rotate, so two
+// concurrent refreshes would each consume the token and clobber the other.
+const inFlightRefresh = new WeakMap<UserSession, Promise<void>>();
 
-  try {
+async function refreshSessionIfNeeded(session: UserSession): Promise<void> {
+  const thirtyMinutes = 30 * 60 * 1000;
+  if (session.expiresAt > Date.now() + thirtyMinutes) return;
+
+  const existing = inFlightRefresh.get(session);
+  if (existing) return existing; // coalesce concurrent callers
+
+  const p = (async () => {
     const resp = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -299,14 +318,16 @@ async function refreshSessionIfNeeded(session: UserSession): Promise<boolean> {
         scope: OAUTH_SCOPES,
       }),
     });
-    if (!resp.ok) return false;
+    if (!resp.ok) throw new Error(`Token refresh failed (${resp.status})`);
 
     const tokens: any = await resp.json();
     session.accessToken = tokens.access_token;
     session.refreshToken = tokens.refresh_token;
     session.expiresAt = Date.now() + tokens.expires_in * 1000;
-    return true;
-  } catch { return false; }
+  })().finally(() => inFlightRefresh.delete(session));
+
+  inFlightRefresh.set(session, p);
+  return p;
 }
 ```
 
@@ -416,7 +437,11 @@ function spawnEnvForUser(session: UserSession): NodeJS.ProcessEnv {
 
 // Usage in endpoint handler:
 app.post("/api/chat", requireAuth, async (req: any, res) => {
-  await refreshSessionIfNeeded(req.userSession);
+  try {
+    await refreshSessionIfNeeded(req.userSession);
+  } catch {
+    return res.status(401).json({ error: "Session expired — please sign in again" });
+  }
   const proc = spawn("claude", [...args], {
     stdio: ["ignore", "pipe", "pipe"],
     env: spawnEnvForUser(req.userSession),
