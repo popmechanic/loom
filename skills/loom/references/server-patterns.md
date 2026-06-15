@@ -242,7 +242,12 @@ app.post("/api/stream", requireAuth, async (req: any, res) => {
     "--max-turns", "15",
     "--model", "sonnet", "--no-session-persistence",
     task
-  ], { env: spawnEnvForUser(req.userSession) });
+  ], {
+    // detached: true puts claude in its own process group so process.kill(-pid)
+    // kills the whole Bash/MCP tool subtree, not just the direct child.
+    detached: true,
+    env: spawnEnvForUser(req.userSession)
+  });
 
   let gotResult = false;
 
@@ -261,10 +266,11 @@ app.post("/api/stream", requireAuth, async (req: any, res) => {
       }
     } else if (event.type === "result") {
       gotResult = true;
-      if (event.is_error) {
-        res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
-      } else if (event.subtype === "error_max_turns") {
+      if (event.subtype === "error_max_turns") {
+        // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
         res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
+      } else if (event.is_error) {
+        res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
       } else {
         res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
       }
@@ -298,7 +304,14 @@ app.post("/api/stream", requireAuth, async (req: any, res) => {
   // req "close" fires prematurely on POST-based SSE endpoints, killing the
   // spawned process before it can respond. res "close" fires only when the
   // client actually disconnects.
-  res.on("close", () => { clearInterval(heartbeat); if (!proc.killed) proc.kill(); });
+  res.on("close", () => {
+    clearInterval(heartbeat);
+    if (!proc.killed) {
+      // Kill the process group so Bash/MCP tool subtrees die too.
+      // Bare proc.kill() only kills the direct child; tool subprocesses survive.
+      try { process.kill(-proc.pid!, "SIGTERM"); } catch { proc.kill(); }
+    }
+  });
 });
 ```
 
@@ -385,7 +398,12 @@ wss.on("connection", (ws: any) => {
       ...sessionArgs,
       "--model", "sonnet",
       payload.prompt
-    ], { env: spawnEnvForUser(userSession) });
+    ], {
+      // detached: true puts claude in its own process group so process.kill(-pid)
+      // kills the whole Bash/MCP tool subtree, not just the direct child.
+      detached: true,
+      env: spawnEnvForUser(userSession)
+    });
 
     isFirstTurn = false;
 
@@ -408,10 +426,11 @@ wss.on("connection", (ws: any) => {
         }
       } else if (event.type === "result") {
         gotResult = true;
-        if (event.is_error) {
-          ws.send(JSON.stringify({ type: "error", message: event.result }));
-        } else if (event.subtype === "error_max_turns") {
+        if (event.subtype === "error_max_turns") {
+          // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
           ws.send(JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" }));
+        } else if (event.is_error) {
+          ws.send(JSON.stringify({ type: "error", message: event.result }));
         } else {
           ws.send(JSON.stringify({ type: "done" }));
         }
@@ -441,7 +460,10 @@ wss.on("connection", (ws: any) => {
   });
 
   ws.on("close", () => {
-    if (activeProc) activeProc.kill();
+    if (activeProc) {
+      // Kill the process group so Bash/MCP tool subtrees die too.
+      try { process.kill(-activeProc.pid!, "SIGTERM"); } catch { activeProc.kill(); }
+    }
   });
 });
 ```
@@ -459,13 +481,33 @@ wss.on("connection", (ws: any) => {
 Long-running task that reports progress.
 
 ```typescript
-const jobs = new Map<string, { status: string; result?: any; error?: string }>();
+const TIMEOUT_MS = 120_000; // 2 minutes — adjust to your workload
+const JOB_TTL_MS = 5 * 60_000; // keep finished jobs for 5 minutes
+
+interface Job {
+  status: string;
+  result?: any;
+  error?: string;
+  proc?: ReturnType<typeof spawn>;   // stored so callers can cancel
+  ownerSessionId: string;            // guards /api/jobs/:id
+  finishedAt?: number;               // for TTL sweep
+}
+const jobs = new Map<string, Job>();
+
+// Periodically delete finished jobs so the map doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.finishedAt && now - job.finishedAt > JOB_TTL_MS) {
+      jobs.delete(id);
+    }
+  }
+}, 60_000);
 
 app.post("/api/jobs", requireAuth, async (req: any, res) => {
   await refreshSessionIfNeeded(req.userSession);
   const jobId = uuidv4();
-  jobs.set(jobId, { status: "running" });
-  res.json({ jobId });
+  const ownerSessionId = req.session.id as string;
 
   const proc = spawn("claude", [
     "-p", "--output-format", "stream-json", "--verbose",
@@ -474,21 +516,44 @@ app.post("/api/jobs", requireAuth, async (req: any, res) => {
     "--permission-mode", "dontAsk",
     "--tools", "Read,Bash,Glob,Grep",
     "--no-session-persistence"
-  ], { stdio: ["pipe", "pipe", "pipe"], env: spawnEnvForUser(req.userSession) });
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+    // detached: spawn in its own process group so proc.kill(-pid) kills the
+    // whole Bash/MCP tool subtree, not just the direct child.
+    detached: true,
+    env: spawnEnvForUser(req.userSession)
+  });
 
+  jobs.set(jobId, { status: "running", proc, ownerSessionId });
+  res.json({ jobId });
+
+  // Guard stdin writes — without this, an EPIPE (write after stdin closed)
+  // crashes the entire server process instead of being handled locally.
+  proc.stdin.on("error", () => {});
   proc.stdin.write(req.body.task);
   proc.stdin.end();
+
+  // Kill the job (and its tool subtree) if it exceeds the timeout.
+  const killTimer = setTimeout(() => {
+    const job = jobs.get(jobId);
+    if (job?.status === "running") {
+      jobs.set(jobId, { ...job, status: "failed", error: "Timeout", finishedAt: Date.now() });
+      try { process.kill(-proc.pid!, "SIGTERM"); } catch { proc.kill(); }
+    }
+  }, TIMEOUT_MS);
 
   let stderrBuf = "";
 
   const parse = createStreamParser((event) => {
     if (event.type === "result") {
-      if (event.is_error) {
-        jobs.set(jobId, { status: "failed", error: event.result });
-      } else if (event.subtype === "error_max_turns") {
-        jobs.set(jobId, { status: "incomplete", result: event });
+      const job = jobs.get(jobId)!;
+      if (event.subtype === "error_max_turns") {
+        // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
+        jobs.set(jobId, { ...job, status: "incomplete", result: event, finishedAt: Date.now() });
+      } else if (event.is_error) {
+        jobs.set(jobId, { ...job, status: "failed", error: event.result, finishedAt: Date.now() });
       } else {
-        jobs.set(jobId, { status: "complete", result: event });
+        jobs.set(jobId, { ...job, status: "complete", result: event, finishedAt: Date.now() });
       }
     }
   });
@@ -500,19 +565,30 @@ app.post("/api/jobs", requireAuth, async (req: any, res) => {
   });
 
   proc.on("close", (code) => {
-    if (jobs.get(jobId)?.status === "running") {
-      jobs.set(jobId, { status: "failed", error: stderrBuf.trim() || `Exit code ${code || "unknown"}` });
+    clearTimeout(killTimer);
+    const job = jobs.get(jobId);
+    if (job?.status === "running") {
+      jobs.set(jobId, { ...job, status: "failed", error: stderrBuf.trim() || `Exit code ${code ?? "unknown"}`, finishedAt: Date.now() });
     }
   });
 
   proc.on("error", (err) => {
-    jobs.set(jobId, { status: "failed", error: err.message });
+    clearTimeout(killTimer);
+    const job = jobs.get(jobId);
+    jobs.set(jobId, { ...(job ?? { ownerSessionId }), status: "failed", error: err.message, finishedAt: Date.now() });
   });
 });
 
-app.get("/api/jobs/:id", (req, res) => {
+app.get("/api/jobs/:id", requireAuth, (req: any, res) => {
   const job = jobs.get(req.params.id);
-  res.json(job || { status: "not_found" });
+  if (!job) return res.json({ status: "not_found" });
+  // Prevent job-ID enumeration: only the session that created the job can read it.
+  if (job.ownerSessionId !== req.session.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  // Omit proc handle from the response (it's not serializable).
+  const { proc: _proc, ...safe } = job;
+  res.json(safe);
 });
 ```
 
@@ -540,9 +616,12 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
         "-p", "--model", "haiku", "--output-format", "json",
         "--permission-mode", "dontAsk",
         "--json-schema", schema, "--tools", "", "--no-session-persistence"
-      ], { stdio: ["pipe", "pipe", "pipe"], env: spawnEnvForUser(req.userSession) });
+      ], { stdio: ["pipe", "pipe", "pipe"], detached: true, env: spawnEnvForUser(req.userSession) });
 
-      const timeout = setTimeout(() => { proc.kill(); reject(new Error("Timeout")); }, TIMEOUT_MS);
+      const killProc = () => {
+        try { process.kill(-proc.pid!, "SIGTERM"); } catch { proc.kill(); }
+      };
+      const timeout = setTimeout(() => { killProc(); reject(new Error("Timeout")); }, TIMEOUT_MS);
       let stdout = "";
       let stderr = "";
 
@@ -554,8 +633,14 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
         clearTimeout(timeout);
         try {
           const parsed = JSON.parse(stdout);
-          if (parsed.is_error) reject(new Error(parsed.result));
-          else resolve(parsed.structured_output);
+          // check subtype before is_error so error_max_turns surfaces as a warning
+          if (parsed.subtype === "error_max_turns") {
+            reject(new Error("Task incomplete — reached turn limit"));
+          } else if (parsed.is_error) {
+            reject(new Error(parsed.result));
+          } else {
+            resolve(parsed.structured_output);
+          }
         } catch (e) {
           reject(new Error(stderr.trim() || `Exit code ${code}`));
         }
@@ -563,6 +648,8 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
 
       proc.on("error", (err) => { clearTimeout(timeout); reject(err); });
 
+      // Guard stdin writes — without this, EPIPE crashes the server process
+      proc.stdin.on("error", () => {});
       proc.stdin.write(`${task}\n\n${item}`);
       proc.stdin.end();
     }))
@@ -653,16 +740,18 @@ if (event.type === "stream_event" && event.event?.delta?.text) {
 ```
 
 **Detecting max-turns exhaustion:** When `--max-turns` is exceeded, the `result`
-event has `subtype: "error_max_turns"` and `is_error: false`. Check `subtype`
-to detect this — it's easy to miss because `is_error` is false:
+event has `subtype: "error_max_turns"` and `is_error: true`; check `subtype` first.
+It's easy to treat it as a hard error when it's really a "incomplete / hit turn limit"
+warning:
 
 ```typescript
 if (event.type === "result") {
   gotResult = true;
-  if (event.is_error) {
-    send({ type: "error", message: event.result });
-  } else if (event.subtype === "error_max_turns") {
+  if (event.subtype === "error_max_turns") {
+    // is_error: true; check subtype first — surface as an "incomplete / hit turn limit" warning, not a hard error
     send({ type: "warning", message: "Task incomplete — reached turn limit" });
+  } else if (event.is_error) {
+    send({ type: "error", message: event.result });
   } else {
     send({ type: "done" });
   }
@@ -710,23 +799,30 @@ async function streamTask(task) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let gotResult = false; // mirror the server-side guard
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n\n");
-    buffer = lines.pop(); // keep incomplete chunk
+    buffer = lines.pop() ?? ""; // keep incomplete chunk; ?? "" avoids rare undefined
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       try {
         const data = JSON.parse(line.slice(6));
         if (data.type === "token") output.textContent += data.text;
-        else if (data.type === "done") { /* stream complete */ }
-        else if (data.type === "warning") output.textContent += `\n[Warning: ${data.message}]`;
-        else if (data.type === "error") output.textContent += `\n[Error: ${data.message}]`;
+        else if (data.type === "done") { gotResult = true; /* stream complete */ }
+        else if (data.type === "warning") { gotResult = true; output.textContent += `\n[Warning: ${data.message}]`; }
+        else if (data.type === "error") { gotResult = true; output.textContent += `\n[Error: ${data.message}]`; }
       } catch { /* malformed SSE data — skip */ }
     }
+  }
+
+  // If the stream ended without a done/warning/error, the server closed early
+  // (crash, network drop, or uncaught exception). Surface it rather than silently stopping.
+  if (!gotResult) {
+    output.textContent += "\n[Error: Stream ended before task completed — please retry]";
   }
 }
 ```
@@ -796,14 +892,16 @@ all three are present:
    ```
 
 3. **`is_error` check on result** → before accessing `structured_output`,
-   check whether Claude flagged the run as failed:
+   check whether Claude flagged the run as failed. Check `subtype` before `is_error`
+   so `error_max_turns` surfaces as a warning, not a hard error:
    ```typescript
    if (event.type === "result") {
      gotResult = true;
-     if (event.is_error) {
-       res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
-     } else if (event.subtype === "error_max_turns") {
+     if (event.subtype === "error_max_turns") {
+       // is_error: true; check subtype first — surface as an "incomplete / hit turn limit" warning
        res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
+     } else if (event.is_error) {
+       res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
      } else {
        res.write(`data: ${JSON.stringify({ type: "done", data: event.structured_output })}\n\n`);
      }
@@ -902,7 +1000,10 @@ function buildPromptWithFiles(
   for (const f of files) {
     if (f.passAsFile) {
       if (!tempDir) tempDir = mkdtempSync(path.join(tmpdir(), "loom-"));
-      const filePath = path.join(tempDir, f.name);
+      // Use path.basename to strip any directory components from f.name.
+      // Without this, f.name = "../../etc/x" would escape tempDir.
+      const safeName = path.basename(f.name) || "upload";
+      const filePath = path.join(tempDir, safeName);
       writeFileSync(filePath, Buffer.from(f.content, "base64"));
       filePaths.push(filePath);
     } else {
