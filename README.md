@@ -38,14 +38,20 @@ This plugin ships three skills — Claude picks the right one from your request:
 
 ## Installation
 
-Either:
+Loom is its own single-plugin marketplace. From inside Claude Code, add the marketplace, then install the plugin:
+
 ```
-/install-plugin popmechanic/loom
+/plugin marketplace add popmechanic/loom
+/plugin install loom@loom
 ```
-or:
+
+`loom@loom` means the `loom` plugin from the `loom` marketplace. To apply it in the current session without restarting:
+
 ```
-/plugin install loom
+/reload-plugins
 ```
+
+Verify and manage it with `/plugin list`, and pull future updates with `/plugin marketplace update loom`.
 
 ## Example prompts
 

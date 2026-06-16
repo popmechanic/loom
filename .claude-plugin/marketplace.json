@@ -1,0 +1,16 @@
+{
+  "name": "loom",
+  "metadata": {
+    "description": "Build applications where Claude Code (claude -p) is the runtime."
+  },
+  "owner": {
+    "name": "Marcus Estes"
+  },
+  "plugins": [
+    {
+      "name": "loom",
+      "source": "./",
+      "description": "Build applications where claude -p is the runtime — a server spawns Claude processes that read files, run commands, and return structured output, while a custom interface renders the results."
+    }
+  ]
+}
