@@ -13,8 +13,11 @@ All patterns use `Bun.serve()` with zero external dependencies.
 - [Pattern: REST Endpoint](#pattern-rest-endpoint)
 - [Pattern: SSE Streaming](#pattern-sse-streaming)
 - [Pattern: WebSocket Session](#pattern-websocket-session)
+- [Pattern: Reconnect-Safe Streaming](#pattern-reconnect-safe-streaming)
+- [Pattern: Interrupting a Run](#pattern-interrupting-a-run)
 - [Pattern: Background Job with Progress](#pattern-background-job-with-progress)
 - [Pattern: Parallel Analysis](#pattern-parallel-analysis)
+- [Multi-Turn via Long-Lived Process](#multi-turn-via-long-lived-process)
 - [Frontend Integration](#frontend-integration)
   - [Streaming Text Display](#streaming-text-display)
   - [Structured Result Rendering](#structured-result-rendering)
@@ -408,6 +411,247 @@ const server = Bun.serve({
 
 ---
 
+## Pattern: Reconnect-Safe Streaming
+
+A plain per-request SSE stream dies on browser reload — the client gets half
+a run and misses everything that happened while the page was reloading. The
+fix: decouple the `claude -p` process lifetime from any browser connection.
+
+**How it works:** A background loop owns the process and appends events to an
+in-memory ring buffer with monotonic ids. Browsers subscribe and ask "give me
+everything after id N" — by sending `?after=<id>` or the standard
+`Last-Event-ID` header. They replay the backlog and then stream live. A 5s
+heartbeat keeps connections from timing out. When the last subscriber
+disconnects, start a grace-period timer (e.g., 30s) before killing the
+process — a reload re-attaches instead of losing the run. Emit a synthetic
+`resync` event when the cursor predates the oldest retained event so the client
+knows to do a full reload instead of assuming it's up to date.
+
+```typescript
+const EVENT_LOG_SIZE = 500; // ring buffer capacity
+
+interface LogEntry {
+  id: number;
+  data: object;
+}
+
+let nextId = 1;
+const eventLog: LogEntry[] = [];
+let activeProc: ReturnType<typeof Bun.spawn> | null = null;
+let clientCount = 0;
+let gracePeriodTimer: ReturnType<typeof setTimeout> | null = null;
+const GRACE_MS = 30_000;
+
+function appendEvent(data: object) {
+  const entry: LogEntry = { id: nextId++, data };
+  eventLog.push(entry);
+  if (eventLog.length > EVENT_LOG_SIZE) eventLog.shift();
+  return entry;
+}
+
+function eventsAfter(cursor: number): LogEntry[] {
+  if (eventLog.length === 0) return [];
+  const oldest = eventLog[0].id;
+  // cursor predates the ring buffer — client needs resync
+  if (cursor > 0 && cursor < oldest) {
+    return [{ id: nextId - 1, data: { type: "resync" } }];
+  }
+  return eventLog.filter(e => e.id > cursor);
+}
+
+async function startRun(prompt: string) {
+  if (activeProc) return; // already running
+
+  activeProc = Bun.spawn(["claude",
+    "-p", "--output-format", "stream-json", "--verbose",
+    "--include-partial-messages",
+    "--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Bash",
+    "--max-turns", "20", "--model", "sonnet", "--no-session-persistence",
+    prompt
+  ], {
+    stdout: "pipe", stderr: "pipe",
+    env: cleanEnv(),
+    // detached: true is not a Bun.spawn option — use the pid for process group
+  });
+
+  const parse = createStreamParser((event) => {
+    if (event.type === "stream_event" && event.event?.delta?.text) {
+      appendEvent({ type: "token", text: event.event.delta.text });
+    } else if (event.type === "assistant" && event.message?.content) {
+      for (const block of event.message.content) {
+        if (block.type === "tool_use") appendEvent({ type: "tool", name: block.name });
+      }
+    } else if (event.type === "result") {
+      if (event.subtype === "error_max_turns") {
+        appendEvent({ type: "warning", message: "Task incomplete — reached turn limit" });
+      } else if (event.is_error) {
+        appendEvent({ type: "error", message: event.result });
+      } else {
+        appendEvent({ type: "done" });
+      }
+    }
+  });
+
+  (async () => {
+    const reader = activeProc!.stdout.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parse(value);
+    }
+    activeProc = null;
+  })();
+}
+
+// SSE subscriber endpoint
+if (url.pathname === "/api/run-stream" && req.method === "GET") {
+  const cursor = Number(req.headers.get("last-event-id") || url.searchParams.get("after") || "0");
+
+  if (clientCount === 0 && gracePeriodTimer) {
+    clearTimeout(gracePeriodTimer);
+    gracePeriodTimer = null;
+  }
+  clientCount++;
+
+  const HEARTBEAT_MS = 5_000;
+  let heartbeatTimer: ReturnType<typeof setInterval>;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      const send = (id: number, data: object) => {
+        controller.enqueue(enc.encode(`id: ${id}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+
+      // Replay backlog
+      for (const e of eventsAfter(cursor)) send(e.id, e.data);
+
+      // Heartbeat
+      heartbeatTimer = setInterval(() => {
+        controller.enqueue(enc.encode(`: heartbeat\n\n`));
+      }, HEARTBEAT_MS);
+
+      // Drain new events by polling (simple approach — swap for a push-based
+      // notifier in high-throughput apps)
+      let lastSent = cursor;
+      const poll = setInterval(() => {
+        for (const e of eventsAfter(lastSent)) {
+          send(e.id, e.data);
+          lastSent = e.id;
+        }
+      }, 50);
+
+      (stream as any)._cleanup = () => {
+        clearInterval(heartbeatTimer);
+        clearInterval(poll);
+        clientCount--;
+        if (clientCount === 0 && activeProc) {
+          gracePeriodTimer = setTimeout(() => {
+            activeProc?.kill();
+            activeProc = null;
+          }, GRACE_MS);
+        }
+      };
+    },
+    cancel() {
+      (stream as any)._cleanup?.();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+```
+
+The key insight: the process runs in the background regardless of how many
+browser tabs are watching. Reload the page and you re-attach to the same run.
+
+---
+
+## Pattern: Interrupting a Run
+
+Shipping no interrupt is a real UX regression. When Claude is doing a long
+agentic run, users need a way to stop it.
+
+The correct approach: send `SIGINT` to the process group, not just the process
+itself. `SIGINT` lets Claude finish the current tool call and emit a clean
+`result` event before exiting. If the process ignores it for ~5s, escalate to
+`SIGKILL`. Disambiguate a user interrupt from a real failure in the UI — show
+"Stopped" not "Error".
+
+To reach the whole process group, spawn Claude with a dedicated process group:
+
+```typescript
+// In Node.js / Bun, Bun.spawn does not expose detached option directly.
+// Use child_process from Bun's Node compat layer for process-group spawning:
+import { spawn } from "child_process";
+
+interface RunHandle {
+  proc: ReturnType<typeof spawn>;
+  pid: number;
+  interrupted: boolean;
+}
+
+let activeRun: RunHandle | null = null;
+
+function spawnDetached(args: string[]): RunHandle {
+  const proc = spawn("claude", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true, // own process group — SIGINT reaches children
+    env: cleanEnv() as NodeJS.ProcessEnv,
+  });
+  return { proc, pid: proc.pid!, interrupted: false };
+}
+
+// POST /api/interrupt — stop the active run
+if (url.pathname === "/api/interrupt" && req.method === "POST") {
+  if (!activeRun) return Response.json({ ok: false, reason: "no active run" });
+
+  const run = activeRun;
+  run.interrupted = true;
+  appendEvent({ type: "status", message: "Stopping…" });
+
+  try {
+    // Negative pid targets the whole process group
+    process.kill(-run.pid, "SIGINT");
+  } catch {
+    // process already gone — nothing to do
+  }
+
+  // Escalate to SIGKILL after 5s if it hasn't exited
+  const killTimer = setTimeout(() => {
+    try { process.kill(-run.pid, "SIGKILL"); } catch { /* already gone */ }
+  }, 5_000);
+
+  run.proc.once("exit", () => {
+    clearTimeout(killTimer);
+    // Emit a disambiguated event so the UI shows "Stopped" not "Error"
+    appendEvent({ type: run.interrupted ? "interrupted" : "done" });
+    activeRun = null;
+  });
+
+  return Response.json({ ok: true });
+}
+```
+
+In the streaming handler, the `interrupted` flag lets the parser emit a
+distinct `{ type: "interrupted" }` event instead of `{ type: "error" }`.
+The frontend checks for `interrupted` and shows "Stopped by user" rather than
+an error state.
+
+**Don't do this:**
+- Don't use `proc.kill()` alone — it sends `SIGTERM` to the top-level process
+  and leaves tool subprocesses (e.g., a `Bash` command) running as orphans.
+- Don't treat `SIGINT` as instant — give the process a few seconds to clean up
+  before escalating to `SIGKILL`.
+
+---
+
 ## Pattern: Background Job with Progress
 
 Long-running task that reports progress via polling.
@@ -590,6 +834,49 @@ if (url.pathname === "/api/batch" && req.method === "POST") {
   return Response.json({ results });
 }
 ```
+
+---
+
+## Multi-Turn via Long-Lived Process
+
+The WebSocket Session pattern above uses `--resume` to continue a session on
+each new turn. A cleaner alternative for apps that need ongoing multi-turn
+interaction or mid-run steering: keep one `claude -p --input-format stream-json`
+process alive for the whole session and write each user turn as a newline-delimited
+JSON message to stdin:
+
+```typescript
+import { spawn } from "child_process";
+
+const proc = spawn("claude", [
+  "-p", "--output-format", "stream-json", "--verbose",
+  "--include-partial-messages",
+  "--input-format", "stream-json",
+  "--permission-mode", "dontAsk", "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
+  "--max-turns", "50", "--model", "sonnet",
+], {
+  stdio: ["pipe", "pipe", "pipe"],
+  env: cleanEnv() as NodeJS.ProcessEnv,
+});
+
+function sendTurn(text: string) {
+  const msg = JSON.stringify({ type: "user", message: { role: "user", content: text } });
+  proc.stdin.write(msg + "\n");
+}
+```
+
+Multi-turn and mid-run steering are the same write: call `sendTurn()` from a
+WebSocket message handler, an HTTP endpoint, or a keyboard event. This avoids
+the cold-start overhead of respawning and the path-traversal risk of managing
+session IDs across turns.
+
+The process stays alive until the app is done or explicitly killed. Pair this
+with the Reconnect-Safe Streaming pattern to survive page reloads while the
+long-lived process is running. That pattern tears down its `Bun.spawn` child with
+a plain `.kill()` — fine for a clean exit, but it doesn't reach a Bash/MCP tool
+subtree. If the long-lived run spawns tool subprocesses you need to stop cleanly,
+spawn it detached via `child_process` and signal the process group, as the
+Interrupting a Run pattern shows.
 
 ---
 

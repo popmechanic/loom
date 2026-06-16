@@ -26,6 +26,9 @@ Complete Bun-side and webview-side code patterns for Loom desktop apps. Read thi
   - [System Tray Integration](#system-tray-integration)
   - [Completion Notification](#completion-notification)
   - [Task List Component](#task-list-component)
+- [Interrupt, Done Right](#interrupt-done-right)
+- [Persistent Duplex Bridge for Multi-Turn](#persistent-duplex-bridge-for-multi-turn)
+- [Surviving a Webview Reload](#surviving-a-webview-reload)
 
 ---
 
@@ -1221,3 +1224,265 @@ function TaskList() {
   );
 }
 ```
+
+---
+
+## Interrupt, Done Right
+
+The skeleton `abort()` in Pattern 2 calls `task.proc.kill("SIGTERM")`. That
+kills the top-level `claude` process but leaves tool grandchildren — a `Bash`
+subshell, a long-running compiler, a node server — alive and consuming
+resources. A proper abort kills the whole process group.
+
+Spawn with `detached: true` so the process becomes its own process group leader:
+
+```typescript
+const proc = Bun.spawn([CLAUDE_BIN, ...args], {
+  stdout: "pipe",
+  stderr: "pipe",
+  env: cleanEnv(),
+  // detached: true makes the process its own group leader so
+  // process.kill(-pid, "SIGINT") reaches every grandchild.
+  detached: true,
+});
+```
+
+Then update the abort handler to signal the entire process group and escalate
+to SIGKILL if the process doesn't exit in 5 seconds:
+
+```typescript
+abort: async ({ taskId }) => {
+  const task = activeTasks.get(taskId);
+  if (!task) return { success: false };
+
+  // Mark the abort before signalling so the stdout pump's exit check knows
+  // the non-zero exit was intentional and suppresses a duplicate error.
+  task.userAborted = true;
+
+  const pid = task.proc.pid;
+  try {
+    // Negative pid signals the entire process group — kills Bash subshells
+    // and any other grandchildren that the top-level claude process spawned.
+    process.kill(-pid, "SIGINT");
+  } catch {
+    // Process already exited — nothing to kill.
+  }
+
+  // Escalate to SIGKILL if the process hasn't exited within 5 seconds.
+  const killTimer = setTimeout(() => {
+    try { process.kill(-pid, "SIGKILL"); } catch {}
+  }, 5000);
+
+  task.proc.exited.then(() => clearTimeout(killTimer)).catch(() => clearTimeout(killTimer));
+
+  clearInterval(task.heartbeat);
+  activeTasks.delete(taskId);
+
+  // Emit a distinct "interrupted" status rather than an error toast —
+  // a user stop is not a failure.
+  rpc.sendProxy.status({ taskId, state: "interrupted", elapsedMs: 0, lastActivityMs: 0 });
+  return { success: true };
+},
+```
+
+Add `"interrupted"` to the `state` union in your RPC schema so the webview
+can render "Stopped" rather than an error:
+
+```typescript
+// In LoomRPC webview.messages.status:
+state: "spawning" | "running" | "thinking" | "tool_use" | "idle" | "interrupted";
+```
+
+**Why this matters:** bare `proc.kill()` sends SIGTERM to one PID. A Bash
+command running inside Claude spawns its own child; that grandchild has a
+different PID and survives the kill. With `detached: true` and a negative-pid
+signal, the kernel delivers SIGINT to every process in the group at once.
+Without it, `claude -p` dies but a long-running Bash subtree keeps running,
+consuming CPU and potentially mutating files with no UI to observe or stop it.
+
+---
+
+## Persistent Duplex Bridge for Multi-Turn
+
+Pattern 3 (Conversational) uses `--resume` per turn: each turn is a fresh
+`claude -p` invocation that loads the previous session by id. That works, but
+spawning a new process per turn adds latency and loses the in-process streaming
+context between turns.
+
+A cleaner approach keeps one `claude -p` process alive across all turns and
+feeds new turns as JSON lines on stdin. Multi-turn and mid-run steering become
+the same write:
+
+```typescript
+let duplexProc: ReturnType<typeof Bun.spawn> | null = null;
+let duplexWriter: WritableStreamDefaultWriter | null = null;
+
+function ensureDuplexBridge(rpc: any) {
+  if (duplexProc) return; // already running
+
+  duplexProc = Bun.spawn(
+    [
+      CLAUDE_BIN, "-p",
+      "--output-format", "stream-json", "--verbose",
+      "--input-format", "stream-json",   // accept turns on stdin
+      "--permission-mode", "bypassPermissions",
+      "--setting-sources", "",
+      "--model", "sonnet",
+    ],
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "pipe",
+      env: cleanEnv(),
+      detached: true,
+    }
+  );
+
+  duplexWriter = duplexProc.stdin.getWriter();
+
+  // Pump stdout as normal
+  const parse = createStreamParser((event) => {
+    deriveAndSendRPC("duplex", event, rpc);
+    if (event.type === "result") {
+      // Turn complete — ready for the next user message.
+    }
+  });
+
+  (async () => {
+    const reader = duplexProc!.stdout.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parse(value);
+      }
+    } catch {}
+  })();
+}
+
+async function sendUserTurn(text: string, rpc: any) {
+  ensureDuplexBridge(rpc);
+  const turn = JSON.stringify({ type: "user", message: { role: "user", content: text } });
+  const encoder = new TextEncoder();
+  await duplexWriter!.write(encoder.encode(turn + "\n"));
+}
+```
+
+Wire this to an RPC handler:
+
+```typescript
+startTask: async ({ prompt }) => {
+  const taskId = crypto.randomUUID();
+  await sendUserTurn(prompt, rpc);
+  return { taskId, sessionId: "duplex" };
+},
+```
+
+**Caveat:** stdin streaming (`--input-format stream-json`) does not work when
+targeting a remote `--resume` URL (such as a Claude.ai session URL). It needs
+a local process with a live stdin pipe. For remote sessions, fall back to
+per-turn respawn with `--resume <id>`.
+
+---
+
+## Surviving a Webview Reload
+
+A webview can reload — during development (`Cmd+R`), after a crash, or
+on ElectroBun's hot-reload. Without extra care, a reload tears down the
+webview's RPC connection while the Bun side is mid-stream: all buffered tokens
+are lost and the user sees a blank screen.
+
+Apply an event-log buffer on the Bun side so a reloaded webview can catch up:
+
+```typescript
+// Seq-numbered ring buffer of emitted RPC messages
+const MSG_RING_SIZE = 500;
+type RingEntry = { seq: number; type: string; payload: any };
+const msgRing: RingEntry[] = [];
+let msgSeq = 0;
+
+function bufferAndSend(type: string, payload: any, rpc: any) {
+  const seq = ++msgSeq;
+  msgRing.push({ seq, type, payload });
+  if (msgRing.length > MSG_RING_SIZE) msgRing.shift();
+
+  // Send to the currently connected webview, threading the seq so the view can
+  // record its last-seen message (the webview's onToken reads it for reconnect).
+  const out = { ...payload, seq };
+  switch (type) {
+    case "token":    rpc.sendProxy.token(out);    break;
+    case "toolUse":  rpc.sendProxy.toolUse(out);  break;
+    case "status":   rpc.sendProxy.status(out);   break;
+    case "done":     rpc.sendProxy.done(out);     break;
+    case "error":    rpc.sendProxy.error(out);    break;
+  }
+}
+```
+
+Add a `reconnect` RPC request so the webview can request a replay on reload:
+
+```typescript
+// Add to RPC schema bun.requests:
+reconnect: {
+  params: { lastSeq: number };
+  response: { replayed: number };
+};
+```
+
+```typescript
+// In the request handlers:
+reconnect: async ({ lastSeq }) => {
+  // Find all messages the webview missed
+  const missed = msgRing.filter((e) => e.seq > lastSeq);
+  for (const entry of missed) {
+    bufferAndSend(entry.type, entry.payload, rpc);
+  }
+  return { replayed: missed.length };
+},
+```
+
+On the webview side, call `reconnect` on mount with the last seq the view saw:
+
+```typescript
+useEffect(() => {
+  const lastSeq = Number(sessionStorage.getItem("lastSeq") ?? "0");
+  electrobun.rpc.request.reconnect({ lastSeq }).then(({ replayed }) => {
+    if (replayed > 0) console.log(`Replayed ${replayed} messages after reload`);
+  });
+}, []);
+
+// Track last seen seq in message handlers:
+callbacks.onToken = ({ seq, ...data }) => {
+  sessionStorage.setItem("lastSeq", String(seq));
+  setOutput((prev) => prev + data.text);
+};
+```
+
+**Grace period:** keep the Claude process alive briefly after the webview
+disconnects (e.g., when the webview is destroyed before reconnecting). A
+10-second timer that cancels on reconnect prevents tearing down a run just
+because the user reloaded:
+
+```typescript
+let reloadGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Called when webview disconnects (ElectroBun fires this on window close/reload)
+function onWebviewDisconnect() {
+  reloadGraceTimer = setTimeout(() => {
+    // No reconnect within 10s — tear down any active runs
+    killAllTasks();
+  }, 10_000);
+}
+
+// Called at the start of the reconnect handler
+function onWebviewReconnect() {
+  if (reloadGraceTimer) {
+    clearTimeout(reloadGraceTimer);
+    reloadGraceTimer = null;
+  }
+}
+```
+
+Without the grace period, a dev-reload kills the active Claude run and the
+developer loses their work-in-progress output. With it, a reload re-attaches
+to the same run transparently.

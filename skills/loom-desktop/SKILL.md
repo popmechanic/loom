@@ -278,6 +278,18 @@ set up code signing with an Apple Developer account.
 > Read `references/distribution.md` for the complete build, signing, DMG icon,
 > and auto-update setup.
 
+### Patterns at a Glance (extended)
+
+Two additional patterns beyond the four core ones:
+
+| Pattern | When to Use | Reference |
+|---------|-------------|-----------|
+| Interrupt, done right | Stop button that also kills tool grandchildren | `references/desktop-patterns.md#interrupt-done-right` |
+| Surviving a webview reload | Dev reload or crash-recovery re-attaches to running process | `references/desktop-patterns.md#surviving-a-webview-reload` |
+
+The duplex bridge pattern (one long-lived `claude -p --input-format stream-json` process fed turns on stdin) is covered in
+`references/desktop-patterns.md#persistent-duplex-bridge-for-multi-turn` as a lower-latency alternative to per-turn `--resume`.
+
 ### Gotchas
 
 Critical issues from real-world development. These 4 bite everyone:
@@ -286,6 +298,7 @@ Critical issues from real-world development. These 4 bite everyone:
 - **#2 Stream buffering** — TCP chunks split JSON lines. Use `createStreamParser`, never raw `split("\n")`.
 - **#13 macOS PATH** — GUI apps don't inherit shell PATH. Use `resolveClaudePath()` at startup.
 - **#12 File.path** — Doesn't exist in system webviews. Use `FileReader.readAsText()` via RPC instead.
+- **Bare kill orphans grandchildren** — `proc.kill()` only signals the top-level process. Spawn with `detached: true` and signal the process group to kill Bash subtrees too. See `references/desktop-patterns.md#interrupt-done-right`.
 
 The remaining 12 gotchas (numbers match `references/gotchas.md`):
 
