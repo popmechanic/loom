@@ -21,7 +21,8 @@ to build applications where Claude is the runtime.
 10. [Hooks](#hooks)
 11. [Agent SDK (Programmatic)](#agent-sdk)
 12. [Safety Controls](#safety-controls)
-13. [Quick Reference Table](#quick-reference)
+13. [Isolation & Embedding Controls](#isolation--embedding-controls)
+14. [Quick Reference Table](#quick-reference)
 
 ---
 
@@ -219,6 +220,24 @@ echo "What's my name?" | claude -p --resume $SESSION
 **Important:** Do NOT combine `--session-id` with `--continue` or `--resume` —
 this errors unless `--fork-session` is also specified. Use `--session-id` on
 the first turn to create the session, then `--resume <id>` on subsequent turns.
+
+### Session-id cwd scoping
+
+A `session_id` is scoped to the project directory derived from the cwd where the
+session was created. Resuming from a different working directory will fail to
+resolve the session even if the UUID is correct. Two options:
+
+- Resume from the same working directory as the original session.
+- Resume by session name (not UUID) to let Claude Code search across all worktrees
+  of the same repo.
+
+```bash
+# Created in /project/main — resume from the same dir
+cd /project/main && claude -p --resume "$SESSION_ID" "continue"
+
+# Or resume by name to search across worktrees
+claude -p --resume "session-name" "continue"
+```
 
 ### Fork a session
 ```bash
@@ -441,11 +460,26 @@ claude -p --max-budget-usd 0.50 "bounded task"
 # Fallback model(s) for reliability — comma-separated, tried in order on overload
 claude -p --model opus --fallback-model sonnet,haiku "important task"
 
+# Safe mode — disables all customizations (CLAUDE.md, skills, plugins, hooks, MCP)
+# while leaving auth and model selection fully functional. Use to reproduce issues
+# in a clean baseline or to run untrusted prompts without extension interference.
+claude -p --safe-mode "troubleshoot clean baseline"
+
 # Model selection (aliases resolve to the current generation)
 claude -p --model haiku "quick extraction"      # Fastest, cheapest (Haiku 4.5)
 claude -p --model sonnet "standard task"         # Balanced default (Sonnet 4.6)
 claude -p --model opus "complex reasoning"       # Best quality (Opus 4.8)
 # claude -p --model fable "hardest agentic work" # Most capable (Fable 5) — uncomment when available on your plan
+
+# Extended-context model aliases
+claude -p --model "sonnet[1m]" "long-context task"   # Sonnet with 1M-token context window
+claude -p --model "opus[1m]" "long-context reasoning" # Opus with 1M-token context window
+
+# Composite aliases
+# best    — Fable 5 if available on your plan, otherwise latest Opus
+# opusplan — Opus in plan mode; auto-switches to Sonnet for execution turns
+claude -p --model best "hardest agentic task"
+claude -p --model opusplan "plan then execute"
 
 # Reasoning effort: low | medium | high | xhigh | max
 claude -p --effort xhigh "agentic coding task"   # Claude Code's own default for coding/agentic work
@@ -473,6 +507,10 @@ happen to live on the box.
 # Control which settings layers load (user / project / local)
 claude -p --setting-sources user,project "task"
 
+# Inherit the user's real config — all three layers — so the embedded Claude
+# behaves exactly as the user's own Claude Code would (useful for dev tools)
+claude -p --setting-sources user,project,local "task"
+
 # Only use MCP servers from --mcp-config; ignore all other MCP configuration
 claude -p --strict-mcp-config --mcp-config ./mcp.json "task"
 
@@ -481,8 +519,47 @@ claude -p --strict-mcp-config --mcp-config ./mcp.json "task"
 claude -p --exclude-dynamic-system-prompt-sections "task"
 
 # Persona/instructions from a file instead of an inline string
+# For large system prompts (30KB+), always use the file form — inline --system-prompt
+# passes the text as a shell argument, which can exceed OS arg-length limits.
 claude -p --system-prompt-file persona.txt "task"
 claude -p --append-system-prompt-file house-rules.txt "task"
+
+# Raise output ceiling for tasks that produce a single large Write (default is low)
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 claude -p "generate full report"
+
+# Isolate config so the app never mutates the user's ~/.claude and multiple
+# per-account processes don't cross-contaminate each other
+CLAUDE_CONFIG_DIR=/tmp/myapp-claude claude -p "task"
+# Alternatively, use a per-account HOME for full isolation
+HOME=/tmp/myapp-home claude -p "task"
+
+# Block plugin-tool hijack in embedded contexts — prevents prompt-injected
+# code from invoking ToolSearch or Skill to load unexpected extensions
+claude -p --disallowed-tools ToolSearch,Skill --disable-slash-commands "task"
+```
+
+### SDK equivalents for embedding hardening
+
+When using the Agent SDK instead of the CLI, the same isolation controls are
+available as options:
+
+```typescript
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+for await (const message of query({
+  prompt: "task",
+  options: {
+    // Inherit the user's real settings layers
+    settingSources: ["user", "project", "local"],
+    // Reuse Claude Code's own system prompt instead of reinventing it
+    systemPrompt: { preset: "claude_code" },
+    // Raise output ceiling for large writes
+    maxOutputTokens: 64000,
+    // Block plugin-tool hijack
+    disallowedTools: ["ToolSearch", "Skill"],
+    disableSlashCommands: true,
+  }
+})) { /* ... */ }
 ```
 
 ### `--bare` (minimal mode)
@@ -528,8 +605,17 @@ must supply context explicitly: `--system-prompt[-file]`,
 | Extra directories | `claude -p --add-dir /path "query"` |
 | Minimal/isolated mode | `claude -p --bare "query"` (API-key auth only) |
 | Limit settings layers | `claude -p --setting-sources user,project "query"` |
+| Inherit all settings | `claude -p --setting-sources user,project,local "query"` |
 | Cache-friendly prefix | `claude -p --exclude-dynamic-system-prompt-sections "query"` |
 | Persona from file | `claude -p --system-prompt-file persona.txt "query"` |
+| Safe mode (no extensions) | `claude -p --safe-mode "query"` |
+| Best available model | `claude -p --model best "query"` |
+| Plan then execute | `claude -p --model opusplan "query"` |
+| 1M-context Sonnet | `claude -p --model "sonnet[1m]" "query"` |
+| 1M-context Opus | `claude -p --model "opus[1m]" "query"` |
+| Isolate config dir | `CLAUDE_CONFIG_DIR=/tmp/app claude -p "query"` |
+| Raise output ceiling | `CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 claude -p "query"` |
+| Block plugin hijack | `claude -p --disallowed-tools ToolSearch,Skill --disable-slash-commands "query"` |
 
 ## Gotchas
 
@@ -546,3 +632,7 @@ must supply context explicitly: `--system-prompt[-file]`,
 11. **`--include-partial-messages` required for token streaming** — Without this flag, `stream-json` output delivers text only as complete `assistant` blocks (no `stream_event` tokens). Add `--include-partial-messages` to get token-by-token deltas for SSE/WebSocket streaming.
 12. **`--bare` forces API-key auth** — Minimal mode never reads `CLAUDE_CODE_OAUTH_TOKEN` or the keychain (auth is strictly `ANTHROPIC_API_KEY` / `apiKeyHelper`). Don't combine it with the OAuth multi-user pattern; it's for single-tenant API-key apps. See Isolation & Embedding Controls.
 13. **`--max-budget-usd` and `--no-session-persistence` are print-mode-only** — They're silently ignored outside `-p`. `--max-budget-usd` is a hard cost ceiling per invocation; pair it with `--max-turns` to bound unattended runs on both cost and loop count.
+14. **Session-id is scoped to the cwd-derived project directory** — A `session_id` created under one working directory won't resolve when `--resume` is run from a different directory. Resume from the same cwd, or use a session name (not UUID) to search across worktrees of the same repo. See Session Management.
+15. **Large system prompts belong in a file** — Inline `--system-prompt` text is passed as a shell argument; on most systems this caps around 2MB, and macOS has a lower effective limit for deeply nested arg strings. For system prompts 30KB or larger, use `--system-prompt-file` or `--append-system-prompt-file` to avoid arg-length errors.
+16. **Default output token ceiling can truncate large writes** — The default `CLAUDE_CODE_MAX_OUTPUT_TOKENS` may be too low for tasks that emit a single large file (e.g., a generated report or code file). Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000` (or higher) in the subprocess environment before the task begins.
+17. **`rate_limit_event` is a real stream-json event** — When the Claude API rate-limits a request mid-stream, it emits `{"type":"rate_limit_event"}`. Production stream parsers should handle it gracefully (e.g., pause and retry) rather than treating it as an unknown event to discard.
