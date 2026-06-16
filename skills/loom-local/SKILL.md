@@ -73,7 +73,8 @@ inherits the machine's credentials automatically — no token injection needed.
 For most apps, start with **REST + SSE**: REST for triggering tasks, SSE for
 streaming progress and results. Add WebSockets only when true bidirectional
 communication is needed (e.g., the user can interrupt or steer while Claude
-is working).
+is working). If the run can outlive the page, stream from an event log — not
+the request — so reloading re-attaches rather than losing the run.
 
 ## The Conversation
 
@@ -196,6 +197,8 @@ Every pattern also handles three failure modes:
 | REST + JSON | One-shot requests, data extraction | `references/server-patterns.md#pattern-rest-endpoint` |
 | SSE Streaming | Streaming text to browser | `references/server-patterns.md#pattern-sse-streaming` |
 | WebSocket | Bidirectional, multi-turn | `references/server-patterns.md#pattern-websocket-session` |
+| Reconnect-Safe Streaming | Runs that outlive a page reload | `references/server-patterns.md#pattern-reconnect-safe-streaming` |
+| Interrupt | Stop button for active runs | `references/server-patterns.md#pattern-interrupting-a-run` |
 | Background Job | Long-running tasks | `references/server-patterns.md#pattern-background-job-with-progress` |
 | Parallel | Batch analysis | `references/server-patterns.md#pattern-parallel-analysis` |
 
