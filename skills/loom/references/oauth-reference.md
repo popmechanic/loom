@@ -15,6 +15,7 @@ manage, no cost on your side. Users bring their own Claude subscription.
 6. [Integration Notes](#integration-notes)
 7. [Multi-User Sessions](#multi-user-sessions)
 8. [Frontend Setup Screen](#frontend-setup-screen)
+9. [Reverse-Proxy-Header Auth](#reverse-proxy-header-auth)
 
 ---
 
@@ -739,6 +740,163 @@ const reader = response.body.getReader();
   session cookie but returns `{needsSetup: true}` instead of 401 when
   the session is missing. This is intentional: the health check is used
   for initial page load to determine which screen to show.
+
+---
+
+## Reverse-Proxy-Header Auth
+
+Some deployment environments handle user authentication at the edge —
+exe.dev, Cloudflare Access, and similar platforms authenticate the person
+before the request reaches your app and then forward their identity via
+HTTP headers (typically `X-Authenticated-User-Email` and
+`X-Authenticated-User-Name`). This section documents how to trust those
+headers safely and what they do and do not replace.
+
+### How it differs from in-app OAuth
+
+The in-app OAuth flow (the rest of this file) has the app initiate
+authorization, exchange a code for tokens, and store each user's
+`CLAUDE_CODE_OAUTH_TOKEN`. Proxy-header auth handles only the user-identity
+layer — it proves who the person is, but it does not provide an Anthropic
+subscription token. The app still needs each user's `CLAUDE_CODE_OAUTH_TOKEN`
+to call the Claude CLI on their behalf. The two concerns are orthogonal:
+use proxy-header auth to identify the user, then look up or prompt for that
+user's Anthropic token separately.
+
+### The core rule: trust headers only when the proxy strips them
+
+`X-Authenticated-User-Email` and `X-Authenticated-User-Name` are just
+HTTP headers. Any client can set them on a direct request to your server
+port. Trusting them is safe only when the reverse proxy is guaranteed to
+strip any client-supplied copies before forwarding its own. Verify this in
+your proxy's documentation — most managed-auth platforms (Cloudflare Access,
+exe.dev) do strip them, but confirm rather than assume.
+
+### Defense-in-depth measures
+
+These defenses are additive. Each one catches a different failure mode.
+Add all of them; they no-op in dev when the related env vars are absent.
+
+**1. Bind the server to `127.0.0.1`.**
+
+The cheapest protection: if the port is not reachable from outside the
+machine, direct-port bypass is not possible.
+
+```typescript
+server.listen(PORT, "127.0.0.1");
+```
+
+In dev on your laptop this still works normally. In production, the reverse
+proxy runs on the same host or forwards via a private interface.
+
+**2. Optional shared-secret header (`X-Proxy-Secret`).**
+
+An attacker who can reach `127.0.0.1` (e.g. from another process on the
+same host) can still forge identity headers. A shared secret the proxy
+always appends rules this out. Store it as an env var; when absent (local
+dev), skip the check.
+
+```typescript
+const PROXY_SECRET = process.env.PROXY_SECRET; // e.g. a random 32-byte hex string
+
+function verifyProxySecret(req: Request): boolean {
+  if (!PROXY_SECRET) return true; // no-op in dev
+  return req.headers.get("x-proxy-secret") === PROXY_SECRET;
+}
+```
+
+**3. Origin allow-list on state-changing methods and WebSocket upgrades.**
+
+Cross-site requests won't carry the proxy's identity headers, but they can
+still hit endpoints that mutate state. Reject non-safe methods (`POST`,
+`PUT`, `DELETE`, `PATCH`) and WebSocket upgrade requests whose `Origin`
+header does not match an allow-list of known trusted origins.
+
+```typescript
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function checkOrigin(req: Request): boolean {
+  const method = req.method.toUpperCase();
+  const isMutating = ["POST", "PUT", "DELETE", "PATCH"].includes(method);
+  const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+  if (!isMutating && !isUpgrade) return true; // GET/HEAD are fine without a check
+  if (ALLOWED_ORIGINS.length === 0) return true; // no-op when unconfigured (dev)
+  const origin = req.headers.get("origin") ?? "";
+  return ALLOWED_ORIGINS.includes(origin);
+}
+```
+
+In dev, leave `ALLOWED_ORIGINS` unset; the check is skipped. In production,
+set it to a comma-separated list of the origins your frontend is served from.
+
+**4. Fail-closed switch (`REQUIRE_PROXY_AUTH=1`).**
+
+In dev the proxy is absent, so the headers will be missing. In production
+they are always present (the proxy sets them). A fail-closed switch lets
+you distinguish the two environments: when `REQUIRE_PROXY_AUTH=1` and the
+identity headers are absent, return 401 rather than silently granting
+access or defaulting to a fallback identity.
+
+```typescript
+function resolveProxyUser(req: Request): { email: string; name?: string } | null {
+  const email = req.headers.get("x-authenticated-user-email");
+  const name  = req.headers.get("x-authenticated-user-name") ?? undefined;
+
+  if (!email) {
+    if (process.env.REQUIRE_PROXY_AUTH === "1") return null; // fail closed
+    return null; // dev: no proxy, no identity
+  }
+  return { email, name };
+}
+```
+
+Usage in a middleware:
+
+```typescript
+function requireProxyAuth(req: Request, res: Response, next: NextFunction) {
+  if (!verifyProxySecret(req)) return res.status(401).json({ error: "Bad proxy secret" });
+  if (!checkOrigin(req))       return res.status(403).json({ error: "Origin not allowed" });
+
+  const user = resolveProxyUser(req);
+  if (!user) return res.status(401).json({ error: "Not authenticated" });
+
+  req.proxyUser = user; // { email, name }
+  next();
+}
+```
+
+### Putting it together
+
+```typescript
+// server startup
+server.listen(PORT, "127.0.0.1"); // bind to loopback
+
+// env in production
+//   PROXY_SECRET=<random hex>
+//   ALLOWED_ORIGINS=https://your-app.exe.dev
+//   REQUIRE_PROXY_AUTH=1
+
+// protected endpoint
+app.post("/api/chat", requireProxyAuth, async (req: any, res) => {
+  const { email } = req.proxyUser; // identity from proxy
+  // look up or prompt for this user's CLAUDE_CODE_OAUTH_TOKEN
+  const token = await getUserToken(email);
+  if (!token) return res.status(403).json({ error: "No Anthropic token for this user" });
+
+  const env = cleanEnv();
+  env.CLAUDE_CODE_OAUTH_TOKEN = token;
+  const proc = spawn("claude", [...args], { env });
+  // ... handle streaming
+});
+```
+
+Notice that `requireProxyAuth` replaces `requireAuth` (the session-cookie
+middleware) — the proxy is now the auth layer, not the app's own session
+store. The app's job is to retrieve each user's Anthropic token by the
+identity the proxy has confirmed. Source: metrc `app/server/auth.ts`.
 
 ---
 
