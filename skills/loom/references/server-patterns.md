@@ -16,6 +16,9 @@ Core server-side code patterns for Loom web apps — shared utilities, communica
 - [Pattern: Parallel Analysis](#pattern-parallel-analysis)
 - [Pattern: Reconnect-Safe Streaming](#pattern-reconnect-safe-streaming)
 - [Pattern: Interrupting a Run](#pattern-interrupting-a-run)
+- [Pattern: Validate Before Reloading a Preview](#pattern-validate-before-reloading-a-preview)
+- [Pattern: Honest Progress for Slow Turns](#pattern-honest-progress-for-slow-turns)
+- [Context-Window Management for Long-Lived Bridges](#context-window-management-for-long-lived-bridges)
 - [Stream-JSON Event Types](#stream-json-event-types)
 - [Frontend Integration](#frontend-integration)
   - [Streaming Text Display](#streaming-text-display)
@@ -957,6 +960,241 @@ the button reacts the same whether the user has one tab open or three.
 **WebSocket variant:** if you're on the WebSocket session pattern instead, the same
 logic applies — on an `{action:"interrupt"}` message, `process.kill(-activeProc.pid!, "SIGINT")`
 the active process and let the `close` handler null it out so the next turn respawns.
+
+---
+
+## Pattern: Validate Before Reloading a Preview
+
+Apps that generate code or markup and render it live (code-generating agents, visual
+builders, live-preview editors) need to guard the preview reload. When Claude writes or
+edits a rendered file, a mid-stream or truncated write produces malformed output. Without
+a validation step that bad output goes straight into the preview iframe — white-screening
+it or worse, causing the page to throw — instead of degrading gracefully.
+
+**The fix:** after each `tool_result` event that targets the rendered file, syntax-check
+the file before swapping it into the preview. If it passes, emit `preview_reload`; if not,
+keep the last-known-good render and emit `preview_reload_failed` with the error. Also
+mtime-gate it so back-to-back tool calls on different files don't produce spurious reloads.
+
+Derived from: `tool_result` events (the stream event that signals a Write/Edit completed).
+Source: VibesOS `ws.ts` / `claude-bridge.ts`.
+
+```typescript
+import { statSync, readFileSync } from "fs";
+import ts from "typescript";
+
+const PREVIEW_FILE = "app/index.tsx"; // the file driving the live preview
+
+let lastMtime = 0;
+let lastGoodSource = ""; // last source that validated successfully
+
+function validateAndMaybeReload(send: (payload: unknown) => void) {
+  let mtime: number;
+  try {
+    mtime = statSync(PREVIEW_FILE).mtimeMs;
+  } catch {
+    return; // file doesn't exist yet — skip
+  }
+  if (mtime === lastMtime) return; // no real change
+  lastMtime = mtime;
+
+  let source: string;
+  try {
+    source = readFileSync(PREVIEW_FILE, "utf8");
+  } catch (err) {
+    send({ type: "preview_reload_failed", error: "Could not read file" });
+    return;
+  }
+
+  // Syntax-check with the TypeScript compiler (or swap in any transpiler).
+  // transpileModule doesn't do type-checking — just catches parse-level errors
+  // (unclosed tags, truncated JSON, missing braces) quickly.
+  try {
+    const result = ts.transpileModule(source, {
+      compilerOptions: { jsx: ts.JsxEmit.React, module: ts.ModuleKind.ESNext },
+    });
+    if (result.diagnostics && result.diagnostics.length > 0) {
+      const msg = result.diagnostics.map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")).join("; ");
+      send({ type: "preview_reload_failed", error: msg });
+      return;
+    }
+    lastGoodSource = source;
+    send({ type: "preview_reload" }); // client swaps the iframe src / hot-reloads
+  } catch (err: any) {
+    // Hard parse failure — keep last-known-good, tell the client
+    send({ type: "preview_reload_failed", error: err.message ?? "Parse error" });
+  }
+}
+
+// Hook into the stream parser. Call validateAndMaybeReload after each tool_result
+// whose tool_name is "Write" or "Edit".
+const parse = createStreamParser((event) => {
+  // ... token/result handling unchanged ...
+  if (
+    event.type === "tool_result" &&
+    (event.tool_name === "Write" || event.tool_name === "Edit")
+  ) {
+    validateAndMaybeReload(send);
+  }
+});
+```
+
+**Why mtime-gating matters:** Claude can call Write several times in one turn. Without
+the mtime check, each `tool_result` triggers a reload attempt — including ones where the
+file content didn't actually change. The mtime gate fires exactly once per real change.
+
+**Fallback on parse failure:** `lastGoodSource` gives you the last successfully validated
+content. Serve it as a fallback (e.g., write it to a `.last-good.tsx` sidecar) so the
+preview stays functional while Claude is mid-edit. The `preview_reload_failed` event lets
+the frontend show a non-blocking indicator ("Saving…") rather than a blank screen.
+
+---
+
+## Pattern: Honest Progress for Slow Turns
+
+When Claude is doing a single large Write with no streaming text, or is thinking hard
+before speaking, the frontend can go silent for 10–90 seconds with no feedback. A
+spinner that says "Working…" for the whole duration erodes trust — users can't tell if
+the app is alive. The right answer is a progress signal that reflects genuine engine
+activity but never lies by claiming completion.
+
+**Four pieces:**
+
+1. **Asymptotic ratcheted progress value** — never decreases, never reaches 100% until
+   the `result` event arrives, caps near 95% mid-run so it visibly stalls rather than
+   jumping to done.
+2. **Activity signals** — derive "underway" from tool-use count and `input_json_delta`
+   byte accumulation so the bar moves meaningfully while a large Write is building.
+3. **Silence-escalating status labels** — show "Thinking…" by default, escalate to
+   "Thinking hard…" at ~45 s without text tokens, then "Still working…" at ~90 s.
+4. **Hard-silence timeout** — a safety backstop distinct from `--max-turns`: kill the
+   process if it has emitted nothing for N seconds. This catches hangs that
+   `--max-turns` never reaches (the process is alive but stuck, not taking turns).
+
+Source: VibesOS `event-translator.ts`, `claude-bridge.ts`.
+
+```typescript
+// Track progress state alongside the stream parser.
+interface ProgressState {
+  value: number;       // 0–1; shown as (value * 100)%
+  toolsUsed: number;
+  bytesAccumulated: number;
+  lastActivityMs: number;
+  silenceTimer?: NodeJS.Timeout;
+  statusLabel: string;
+}
+
+function calcProgress(state: ProgressState): number {
+  // Ratchet: never decrease, approach 95% asymptotically based on known signals.
+  // Base: 5% just for starting.
+  // +30% spread across first 5 tool calls (encourages early movement).
+  // +30% for byte accumulation (large writes need visible progress).
+  // Cap at 0.95 — the final 5% only unlocks on the result event.
+  const toolContrib = Math.min(state.toolsUsed / 5, 1) * 0.3;
+  const byteContrib = Math.min(state.bytesAccumulated / 50_000, 1) * 0.3;
+  const raw = 0.05 + toolContrib + byteContrib;
+  return Math.max(state.value, Math.min(raw, 0.95)); // ratchet: never decrease
+}
+
+function updateSilenceLabel(state: ProgressState, send: (p: unknown) => void) {
+  const silentMs = Date.now() - state.lastActivityMs;
+  if (silentMs > 90_000) {
+    state.statusLabel = "Still working…";
+  } else if (silentMs > 45_000) {
+    state.statusLabel = "Thinking hard…";
+  } else {
+    state.statusLabel = "Thinking…";
+  }
+  send({ type: "progress", value: state.value, label: state.statusLabel });
+}
+
+const HARD_SILENCE_MS = 120_000; // kill process if nothing at all for 2 minutes
+
+function startHardSilenceTimer(proc: ReturnType<typeof spawn>, send: (p: unknown) => void) {
+  return setTimeout(() => {
+    send({ type: "error", message: "Claude stopped responding — process killed" });
+    try { process.kill(-proc.pid!, "SIGKILL"); } catch { proc.kill(); }
+  }, HARD_SILENCE_MS);
+}
+
+// Integrate into createStreamParser:
+const progressState: ProgressState = {
+  value: 0, toolsUsed: 0, bytesAccumulated: 0,
+  lastActivityMs: Date.now(), statusLabel: "Thinking…",
+};
+
+// Poll silence labels every 10 s.
+const silencePoll = setInterval(() => updateSilenceLabel(progressState, send), 10_000);
+let hardSilenceTimer = startHardSilenceTimer(proc, send);
+
+const parse = createStreamParser((event) => {
+  // Reset hard-silence timer on any activity.
+  clearTimeout(hardSilenceTimer);
+  hardSilenceTimer = startHardSilenceTimer(proc, send);
+  progressState.lastActivityMs = Date.now();
+  progressState.statusLabel = "Thinking…"; // reset escalation on any event
+
+  if (event.type === "stream_event") {
+    if (event.event?.delta?.text) {
+      send({ type: "token", text: event.event.delta.text });
+    }
+    // input_json_delta: tool input arriving incrementally (large Write filling in)
+    if (event.event?.delta?.type === "input_json_delta") {
+      progressState.bytesAccumulated += (event.event.delta.partial_json ?? "").length;
+    }
+  } else if (event.type === "assistant" && event.message?.content) {
+    for (const block of event.message.content) {
+      if (block.type === "tool_use") {
+        progressState.toolsUsed++;
+        send({ type: "tool", name: block.name });
+      }
+    }
+  } else if (event.type === "result") {
+    clearInterval(silencePoll);
+    clearTimeout(hardSilenceTimer);
+    send({ type: "progress", value: 1, label: "Done" }); // final unlock to 100%
+    if (event.subtype === "error_max_turns") {
+      send({ type: "warning", message: "Task incomplete — reached turn limit" });
+    } else if (event.is_error) {
+      send({ type: "error", message: event.result });
+    } else {
+      send({ type: "done" });
+    }
+  }
+
+  progressState.value = calcProgress(progressState);
+  send({ type: "progress", value: progressState.value, label: progressState.statusLabel });
+});
+```
+
+**Frontend:** render progress value as a bar width (`style="width: ${(value*100).toFixed(1)}%"`)
+and the label as a status line. The ratchet guarantees the bar only moves forward,
+removing the unsettling "progress went backwards" effect that naive time-based estimates
+produce. On the `done` event, snap value to 1 and animate to full-width.
+
+**The hard-silence timeout vs `--max-turns`:** `--max-turns` limits how many agent turns
+Claude takes, but a process can hang inside a single turn (a stuck Bash command, a
+network call that never returns). The hard-silence timer kills the process by wall-clock
+silence, which `--max-turns` never catches. Set it generously (2–5 minutes) to avoid
+false positives on legitimately slow but live operations.
+
+---
+
+## Context-Window Management for Long-Lived Bridges
+
+A long-lived `claude -p` process (persistent session, duplex bridge) eventually fills its
+context window. When it does, the next turn fails rather than answering. Track `input_tokens`
+from the `result` event against `contextWindow − maxOutputTokens` from `modelUsage` or
+known model limits; at around 70%, kill the process and respawn it, replaying a windowed
+history prelude as the first user message.
+
+Tie the history replay to the respawn itself — not to a conversation-switch event. An
+untracked respawn (crash, OOM, accidental restart) answers with no context unless you
+replay unconditionally on every fresh process.
+
+For the full pattern (append-only event log, projection tables, atomic resume-pointer
+writes) see `references/advanced-patterns.md#persistent-session-long-lived-process`.
+Source: metrc `budget.ts`.
 
 ---
 
