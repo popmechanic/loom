@@ -11,6 +11,7 @@ Only `skills/` and plugin metadata ship to users. Everything else is local dev t
 - `skills/loom-local/` — local web app skill (SKILL.md + references/)
 - `skills/loom-desktop/` — desktop app skill (SKILL.md + references/)
 - `.claude-plugin/plugin.json` — plugin metadata (name, version, description)
+- `.claude-plugin/marketplace.json` — single-plugin marketplace manifest (lets `/plugin marketplace add popmechanic/loom` find the plugin via `source: "./"`)
 - `assets/` — logo images
 - `README.md`, `LICENSE`
 

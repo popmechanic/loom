@@ -1,8 +1,7 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "loom",
-  "metadata": {
-    "description": "Build applications where Claude Code (claude -p) is the runtime."
-  },
+  "description": "Loom — build applications where Claude Code (claude -p) is the runtime. Skills for deployed web apps, local web tools, and native desktop apps.",
   "owner": {
     "name": "Marcus Estes"
   },
@@ -10,7 +9,14 @@
     {
       "name": "loom",
       "source": "./",
-      "description": "Build applications where claude -p is the runtime — a server spawns Claude processes that read files, run commands, and return structured output, while a custom interface renders the results."
+      "description": "Build applications where Claude Code CLI (claude -p) is the runtime — a server spawns Claude processes that read files, run commands, and return structured output, while a custom interface renders the results.",
+      "category": "development",
+      "keywords": ["claude-code", "runtime", "cli", "agent", "structured-output"],
+      "homepage": "https://github.com/popmechanic/loom",
+      "license": "MIT",
+      "author": {
+        "name": "Marcus Estes"
+      }
     }
   ]
 }
