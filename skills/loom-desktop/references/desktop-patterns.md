@@ -1314,8 +1314,6 @@ feeds new turns as JSON lines on stdin. Multi-turn and mid-run steering become
 the same write:
 
 ```typescript
-import { BrowserView } from "electrobun/bun";
-
 let duplexProc: ReturnType<typeof Bun.spawn> | null = null;
 let duplexWriter: WritableStreamDefaultWriter | null = null;
 
@@ -1408,13 +1406,15 @@ function bufferAndSend(type: string, payload: any, rpc: any) {
   msgRing.push({ seq, type, payload });
   if (msgRing.length > MSG_RING_SIZE) msgRing.shift();
 
-  // Send to the currently connected webview
+  // Send to the currently connected webview, threading the seq so the view can
+  // record its last-seen message (the webview's onToken reads it for reconnect).
+  const out = { ...payload, seq };
   switch (type) {
-    case "token":    rpc.sendProxy.token(payload);    break;
-    case "toolUse":  rpc.sendProxy.toolUse(payload);  break;
-    case "status":   rpc.sendProxy.status(payload);   break;
-    case "done":     rpc.sendProxy.done(payload);     break;
-    case "error":    rpc.sendProxy.error(payload);    break;
+    case "token":    rpc.sendProxy.token(out);    break;
+    case "toolUse":  rpc.sendProxy.toolUse(out);  break;
+    case "status":   rpc.sendProxy.status(out);   break;
+    case "done":     rpc.sendProxy.done(out);     break;
+    case "error":    rpc.sendProxy.error(out);    break;
   }
 }
 ```

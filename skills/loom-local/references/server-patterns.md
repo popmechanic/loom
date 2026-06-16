@@ -462,7 +462,6 @@ function eventsAfter(cursor: number): LogEntry[] {
 async function startRun(prompt: string) {
   if (activeProc) return; // already running
 
-  // Detached process group so SIGINT reaches the whole tree
   activeProc = Bun.spawn(["claude",
     "-p", "--output-format", "stream-json", "--verbose",
     "--include-partial-messages",
@@ -873,7 +872,11 @@ session IDs across turns.
 
 The process stays alive until the app is done or explicitly killed. Pair this
 with the Reconnect-Safe Streaming pattern to survive page reloads while the
-long-lived process is running.
+long-lived process is running. That pattern tears down its `Bun.spawn` child with
+a plain `.kill()` — fine for a clean exit, but it doesn't reach a Bash/MCP tool
+subtree. If the long-lived run spawns tool subprocesses you need to stop cleanly,
+spawn it detached via `child_process` and signal the process group, as the
+Interrupting a Run pattern shows.
 
 ---
 

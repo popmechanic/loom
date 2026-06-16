@@ -846,8 +846,11 @@ function resolveProxyUser(req: Request): { email: string; name?: string } | null
   const name  = req.headers.get("x-authenticated-user-name") ?? undefined;
 
   if (!email) {
-    if (process.env.REQUIRE_PROXY_AUTH === "1") return null; // fail closed
-    return null; // dev: no proxy, no identity
+    // Headers absent. In production that means the proxy did not authenticate
+    // the request, so fail closed. In dev there is no proxy, so fall back to a
+    // configurable identity rather than locking yourself out locally.
+    if (process.env.REQUIRE_PROXY_AUTH === "1") return null;          // fail closed
+    return { email: process.env.DEV_PROXY_USER ?? "dev@localhost" };  // dev fallback
   }
   return { email, name };
 }
