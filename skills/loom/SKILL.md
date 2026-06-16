@@ -147,6 +147,10 @@ output as rich UI:
 Design the JSON schema to match the UI components you want to render. The schema
 IS your API contract between Claude and the frontend.
 
+For richer session UIs — live tool calls with running/done status, streaming
+tool input progress, diffs, plan/todo checklists, reasoning panels, and a
+context-window meter — see `references/session-ux.md`.
+
 ### 5. What are the safety boundaries?
 
 Web apps add security concerns that CLIs don't have:
@@ -164,6 +168,9 @@ Web apps add security concerns that CLIs don't have:
   Prefer `dontAsk` (auto-denies unallowed tools) over `bypassPermissions` (skips all checks).
   Only use `bypassPermissions` when `--allowedTools` fully constrains Claude's capabilities
   and you need unattended execution in a trusted environment (CI/CD, local dev tools).
+- **Securing tool access**: An approval gate alone is not enough — some built-in tools
+  can bypass it. Narrow the surface with `--allowedTools` and name dangerous ones in
+  `--disallowedTools` too (see `references/advanced-patterns.md#securing-tool-access-a-gate-is-not-enough`).
 - **Multi-tenancy**: If multiple users, each needs isolated sessions (see the multi-user
   pattern in `references/oauth-reference.md`). Each user authenticates independently,
   gets a session cookie, and their Claude processes receive their own token via env var.
@@ -314,6 +321,9 @@ Three helpers used by every pattern: `cleanEnv()` (remove nesting guards),
 | Persistent Session | Long-lived process, lower latency | `references/advanced-patterns.md#persistent-session-long-lived-process` |
 | Action Markers | Mid-stream structured events | `references/advanced-patterns.md#action-markers` |
 | HTTP Hooks | Tool lifecycle events, browser permission approval | `references/advanced-patterns.md#http-hooks` |
+| Validate Preview | Avoid white-screening on mid-stream writes | `references/server-patterns.md#pattern-validate-before-reloading-a-preview` |
+| Honest Progress | Show truthful progress when tokens aren't flowing | `references/server-patterns.md#pattern-honest-progress-for-slow-turns` |
+| Durable Sessions | Survive a restart; persist transcript + session_id | `references/advanced-patterns.md#durable-sessions-survive-a-restart` |
 
 > Read `references/server-patterns.md` when implementing a specific server
 > endpoint or wiring up the frontend. Read `references/advanced-patterns.md`
@@ -421,7 +431,15 @@ for each, but they're easy to miss or deviate from when generating a new app.
 - [ ] WebSocket upgrade validates the session cookie from `req.headers.cookie` — Express middleware does not run on WebSocket handshakes
 
 For simple apps, a single `server.ts` serving a static `index.html` is ideal.
-For complex UIs, scaffold a React frontend with a separate server.
+For complex UIs, scaffold a React frontend with a separate server. For the
+frontend itself, a no-build-step approach (UMD React + Babel-in-browser, or
+plain HTML/JS) matches the thin-bridge ethos and ships faster — reach for a
+bundled build only when the UI complexity justifies it. All five reference apps
+shipped no-build frontends.
+
+When deploying behind a trusted reverse proxy (exe.dev, Cloudflare Access) that
+handles user identity, the proxy-header auth alternative avoids the full OAuth
+flow for the user-identity layer — see `references/oauth-reference.md#reverse-proxy-header-auth`.
 
 After generating, offer to start the server and open it in the browser together.
 Then iterate based on what the person sees.
