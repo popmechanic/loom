@@ -84,6 +84,12 @@ bidirectional communication (e.g., the user can interrupt or steer while
 Claude is working). Add **HTTP Hooks** when you need structured tool-lifecycle
 events or UI-driven permission approval (see `references/advanced-patterns.md#http-hooks`).
 
+When a run can outlive the page — long tasks, or users who refresh or open a
+second tab — don't tie the stream to a single request. A plain per-request SSE
+stream dies on reload (the most common thing a user does), losing the run. Put a
+server-side event log between Claude and the browser so clients can reconnect and
+replay what they missed (see `references/server-patterns.md#pattern-reconnect-safe-streaming`).
+
 ## The Conversation
 
 When someone comes to you with an idea, walk through these design questions.
@@ -107,9 +113,9 @@ How does the person's action translate to a Claude invocation?
 |-------------|----------------|
 | Click a button, get a result | One-shot `claude -p`, REST response |
 | Watch progress in real-time | Stream-JSON → SSE to browser |
-| Multi-step workflow with state | Session-based (`--session-id` first turn, `--resume <id>` after) |
+| Multi-step workflow with state | Session-based (`--session-id` first turn, `--resume <id>` after), or a persistent duplex bridge (`references/advanced-patterns.md#persistent-session-long-lived-process`) |
 | Concurrent analysis of multiple items | Parallel `claude -p` processes |
-| Person steers while Claude works | Bidirectional streaming via WebSocket |
+| Person steers while Claude works | Persistent stdin bridge: write user messages mid-run; stop with an interrupt (`references/server-patterns.md#pattern-interrupting-a-run`) |
 
 ### 3. What does Claude actually do?
 
@@ -186,6 +192,36 @@ immediately, even when using slower models.
 
 Default to **Node.js/TypeScript** with **Express** for the server and plain
 **HTML/CSS/JS** or **React** for the frontend, unless the person prefers otherwise.
+
+### Choosing the runtime: CLI vs Agent SDK
+
+Loom spawns the `claude -p` CLI rather than calling the Claude Agent SDK
+(`@anthropic-ai/claude-agent-sdk`) as a library, and the reason is authentication.
+The CLI authenticates with the user's Claude **subscription** via OAuth: `claude
+setup-token` mints a one-year `CLAUDE_CODE_OAUTH_TOKEN` scoped to inference, and the
+server injects each user's token into their own spawned process (see Authentication
+Setup). No API key, no per-call billing — every user brings their own subscription.
+
+The Agent SDK, used as a library, authenticates only with `ANTHROPIC_API_KEY`, and
+Anthropic's policy is explicit that third-party products built on the SDK should not
+offer claude.ai/subscription login. (The SDK can reach a subscription only by
+pointing `pathToClaudeCodeExecutable` at a real `claude` binary running under the
+user's own `HOME` — i.e. driving the CLI anyway — which is fine for a single-user
+local tool but not a deployed multi-user server.)
+
+So for a deployed Loom app, use the CLI. Reach for the SDK only when the app is
+deliberately API-key-based — an internal or billed tool where you own the key and
+per-call cost is acceptable. Everything the SDK is praised for has a CLI equivalent
+that keeps subscription OAuth:
+
+| SDK convenience | CLI equivalent (keeps subscription OAuth) |
+|-----------------|-------------------------------------------|
+| `canUseTool` browser approval | `PreToolUse` HTTP hook → browser (`references/advanced-patterns.md#http-hooks`) |
+| Queued steering / mid-turn input | Duplex `--input-format stream-json` on stdin (`references/advanced-patterns.md#persistent-session-long-lived-process`) |
+| `sessionStore` / resume | `--session-id` first turn, `--resume <id>` after, plus your own transcript store |
+| Programmatic `mcpServers` | `--mcp-config` / `--strict-mcp-config` |
+| Typed partial-message stream | `--include-partial-messages` |
+| Structured output + retry | `--json-schema` |
 
 ### Authentication Setup
 
@@ -272,6 +308,8 @@ Three helpers used by every pattern: `cleanEnv()` (remove nesting guards),
 | WebSocket | Bidirectional, multi-turn | `references/server-patterns.md#pattern-websocket-session` |
 | Background Job | Long-running tasks | `references/server-patterns.md#pattern-background-job-with-progress` |
 | Parallel | Batch analysis | `references/server-patterns.md#pattern-parallel-analysis` |
+| Reconnect-Safe Stream | Survive browser reload, multi-tab, runs that outlive a request | `references/server-patterns.md#pattern-reconnect-safe-streaming` |
+| Interrupt | Stop an in-flight run from the UI | `references/server-patterns.md#pattern-interrupting-a-run` |
 | Structured Extraction | Fast async data extraction (Haiku) | `references/advanced-patterns.md#structured-extraction-async-haiku` |
 | Persistent Session | Long-lived process, lower latency | `references/advanced-patterns.md#persistent-session-long-lived-process` |
 | Action Markers | Mid-stream structured events | `references/advanced-patterns.md#action-markers` |

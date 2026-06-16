@@ -65,9 +65,19 @@ async function extract<T>(prompt: string, schema: object, session: UserSession, 
 
 ## Persistent Session (Long-Lived Process)
 
-Instead of spawning a new process per request, keep one Claude process alive
-and send messages via JSONL on stdin. Lower latency, continuous context, no
-session serialization overhead. The tradeoff is lifecycle management.
+This is the clean way to do **multi-turn** — not just a latency optimization.
+Instead of spawning a fresh process per turn and stitching context back together
+with `--resume`, keep one Claude process alive and write each user turn as JSONL on
+its stdin. The process holds the conversation in its own context, so you get
+continuous state, lower latency, and no session-serialization juggling. The tradeoff
+is lifecycle management (start, stop, inactivity timeout).
+
+**Multi-turn and steering are the same primitive.** Because stdin stays open, a
+message written *while the model is mid-turn* simply continues that turn — there's no
+separate "interrupt and re-prompt" mechanism to build. Sending the next user message
+and steering an in-flight run are both the same `write({type:"user",...})` call. (To
+*stop* a turn rather than add to it, see
+`references/server-patterns.md#pattern-interrupting-a-run`.)
 
 ```typescript
 import { spawn, ChildProcess } from "child_process";
@@ -164,6 +174,20 @@ Key differences from the per-request patterns:
 - Lifecycle management required: start, stop, inactivity timeout
 - `getOrStart` is lazy — call it before `sendMessage` to ensure the process exists
 - Each session gets its own spawned process with its own `CLAUDE_CODE_OAUTH_TOKEN`; never share a process across users
+
+**Caveat — stdin streaming needs a local session, not a remote `--resume` URL.**
+`--input-format stream-json` drives a process over a pipe. It silently fails against a
+remote session URL (`--resume <url>`), which needs a PTY — the process starts but never
+answers. If you're driving a remote session, pass the prompt as a CLI argument and
+re-spawn per turn instead of holding stdin open.
+
+**Survive a stream crash without dropping input.** If the process dies mid-conversation
+(overload, OOM, a killed tool subtree), any user messages you queued but hadn't yet
+delivered are gone unless you buffer them. Keep a small per-session outbox: enqueue each
+turn, mark it delivered only after `getOrStart` confirms the process is alive and the
+write succeeds, and on respawn drain the outbox into the new process. Without this, a
+crash in the window between "user hit send" and "process accepted the message" loses the
+turn with no error surfaced to anyone.
 
 ---
 
@@ -423,3 +447,61 @@ async function respondPermission(requestId, approved) {
   to route permission requests to the correct browser tab.
 - If no browser is connected, auto-deny for safety. Don't let tool calls
   hang forever waiting for a user who isn't there.
+
+### Hardening the Approval Gate
+
+The flow above is the happy path. Three failure modes turn it from a demo into
+something you can trust with real side effects.
+
+**Don't auto-deny a pending approval on a timer.** The sample resolves to `deny` after
+90s, but auto-denying a sensitive write *because the human was still reading it* is
+worse than waiting — a denied tool is final, and Claude moves on without it. Prefer no
+approval timeout, and let session teardown (below) settle anything still pending. If you
+must bound it, make the window long and surface a clear "timed out — try again" state
+rather than a silent deny that's indistinguishable from the user clicking no.
+
+**Fail all pending approvals when the run ends.** If the Claude process dies (crash,
+interrupt, inactivity kill) while an approval is parked, the pending Promise leaks — and
+worse, a late `/api/permission-response` for that request can resolve a dead run's
+Promise and write a misleading "approved" into your audit log. On process close, settle
+every request for that session as denied and clear the map:
+
+```typescript
+// Track sessionId on each pending entry: pendingPermissions.set(id, { resolve, timer, sessionId }).
+function failAllPending(sessionId: string) {
+  for (const [id, pending] of pendingPermissions) {
+    if (pending.sessionId !== sessionId) continue;
+    clearTimeout(pending.timer);
+    pending.resolve({ hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "Run ended before the request was answered",
+    }});
+    pendingPermissions.delete(id);
+  }
+}
+// Call from the run's proc.on("close") and from your interrupt handler.
+```
+
+**Clean up on the normal path too.** When a decision arrives, clear the timer and delete
+the map entry (the sample does this) — and detach any abort listener you registered for
+the request so it can't fire later against a freed entry.
+
+**Offer four decisions, not two.** A real Claude Code session lets you approve once,
+approve for the rest of the session, decline, or stop entirely. Mirror that:
+
+- **Approve once** / **Decline** — resolve this one request allow/deny.
+- **Always allow this session** — record the tool (e.g. `Bash(npm test)`, or just the
+  tool name) in a server-side per-session allowlist, then resolve allow. Check that
+  allowlist at the *top* of the `PreToolUse` handler and auto-approve a match before you
+  push a card to the browser — otherwise "always allow" still prompts every time.
+- **Cancel turn** — resolve this request as deny *and* interrupt the run
+  (`references/server-patterns.md#pattern-interrupting-a-run`), so the user can stop a
+  wrong direction instead of rubber-stamping their way out of it.
+
+> The Agent SDK's equivalent of this whole flow is the `canUseTool` callback, which
+> returns `{behavior: "allow", updatedInput}` or `{behavior: "deny", message}` (note the
+> `behavior`/`message` shape, not `allow`/`reason`). It's cleaner where available — but
+> it's SDK-only, and the SDK authenticates with an API key rather than subscription OAuth
+> (see "Choosing the runtime" in `SKILL.md`), so for a subscription-OAuth web app the
+> `PreToolUse` hook above is the path.

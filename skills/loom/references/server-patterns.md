@@ -14,6 +14,8 @@ Core server-side code patterns for Loom web apps — shared utilities, communica
 - [Pattern: WebSocket Session](#pattern-websocket-session)
 - [Pattern: Background Job with Progress](#pattern-background-job-with-progress)
 - [Pattern: Parallel Analysis](#pattern-parallel-analysis)
+- [Pattern: Reconnect-Safe Streaming](#pattern-reconnect-safe-streaming)
+- [Pattern: Interrupting a Run](#pattern-interrupting-a-run)
 - [Stream-JSON Event Types](#stream-json-event-types)
 - [Frontend Integration](#frontend-integration)
   - [Streaming Text Display](#streaming-text-display)
@@ -715,6 +717,246 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
   res.json({ results });
 });
 ```
+
+---
+
+## Pattern: Reconnect-Safe Streaming
+
+The SSE and WebSocket patterns above tie one stream to one HTTP request and one
+process. That's fine until the page goes away — and a browser reload (or a second
+tab, or a dropped phone connection) is the single most common thing a user does.
+When the request ends, the stream ends; with `res.on("close")` cleanup it can even
+kill the run mid-flight. The fix is to stop streaming *from the request* and start
+streaming *from a log*.
+
+One background loop owns the Claude process and parses its output exactly once.
+Every parsed event is appended to a server-side append-only log with a monotonic
+id. Browsers are pure subscribers: they connect, replay everything after their
+last-seen id, then receive live events. A reload reconnects, replays what it
+missed, and continues — the run never noticed.
+
+```typescript
+// Builds on Server Setup + Shared Utilities (createStreamParser, spawnEnvForUser).
+import { spawn, ChildProcess } from "child_process";
+import { v4 as uuidv4 } from "uuid";
+
+// One event log per run. Monotonic ids; a ring buffer bounds memory. Swap the
+// array for a DB table or Redis stream when events must survive a server restart.
+interface LoggedEvent { id: number; data: unknown; }
+interface Run {
+  proc: ChildProcess;
+  events: LoggedEvent[];
+  nextId: number;
+  firstId: number;            // oldest id still retained — for overflow detection
+  subscribers: Set<(e: LoggedEvent) => void>;
+  done: boolean;
+  interrupted?: boolean;      // set by the interrupt pattern below
+  ownerSessionId: string;
+  graceTimer?: NodeJS.Timeout;
+}
+const RING = 2000;
+const GRACE_MS = 30_000;       // keep a run alive this long after the last client leaves
+const runs = new Map<string, Run>();
+
+function append(run: Run, data: unknown) {
+  const evt = { id: run.nextId++, data };
+  run.events.push(evt);
+  if (run.events.length > RING) { run.events.shift(); run.firstId = run.events[0].id; }
+  for (const send of run.subscribers) send(evt);
+}
+
+// Start a run: spawn once, parse once, append to the log. Returns a runId.
+app.post("/api/runs", requireAuth, async (req: any, res) => {
+  try { await refreshSessionIfNeeded(req.userSession); }
+  catch { return res.status(401).json({ error: "Session expired — please sign in again" }); }
+
+  const runId = uuidv4();
+  // detached: true so process.kill(-pid) can later target the whole tool subtree.
+  const proc = spawn("claude", [
+    "-p", "--output-format", "stream-json", "--verbose",
+    "--include-partial-messages",
+    "--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Bash",
+    "--max-turns", "15", "--model", "sonnet", "--no-session-persistence",
+    req.body.task
+  ], { detached: true, env: spawnEnvForUser(req.userSession) });
+
+  const run: Run = {
+    proc, events: [], nextId: 1, firstId: 1, subscribers: new Set(),
+    done: false, ownerSessionId: req.cookies[SESSION_COOKIE_NAME],
+  };
+  runs.set(runId, run);
+  res.json({ runId });   // client immediately opens GET /api/runs/:id/events
+
+  const parse = createStreamParser((event) => {
+    if (event.type === "stream_event" && event.event?.delta?.text) {
+      append(run, { type: "token", text: event.event.delta.text });
+    } else if (event.type === "assistant" && event.message?.content) {
+      for (const block of event.message.content) {
+        if (block.type === "tool_use") append(run, { type: "tool", name: block.name });
+      }
+    } else if (event.type === "result") {
+      // check subtype before is_error — error_max_turns is a warning, not a failure
+      if (event.subtype === "error_max_turns") append(run, { type: "warning", message: "Task incomplete — reached turn limit" });
+      else if (event.is_error) append(run, { type: "error", message: event.result });
+      else append(run, { type: "done" });
+    }
+  });
+  proc.stdout.on("data", parse);
+  proc.stderr.on("data", (c) => { const m = c.toString().trim(); if (m) console.error(`[claude stderr] ${m}`); });
+  proc.on("close", (code) => {
+    // A user interrupt is not a failure — the interrupt pattern already logged it.
+    if (run.nextId === 1 && !run.interrupted) {
+      append(run, { type: "error", message: `Claude exited with code ${code} before producing output` });
+    }
+    run.done = true;
+    append(run, { type: "closed" });
+  });
+});
+
+// Subscribe: replay after the cursor, then stream live. Survives reloads.
+app.get("/api/runs/:id/events", requireAuth, (req: any, res) => {
+  const run = runs.get(req.params.id);
+  if (!run) return res.status(404).end();
+  if (run.ownerSessionId !== req.cookies[SESSION_COOKIE_NAME]) return res.status(403).end();
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  // Cursor: ?after=<id>, or the Last-Event-ID header the browser auto-resends on
+  // reconnect (it remembers the last `id:` it saw). Either way, replay the gap.
+  const after = Number(req.query.after ?? req.headers["last-event-id"] ?? 0);
+
+  const write = (evt: LoggedEvent) => {
+    if (res.writableEnded) return;
+    try { res.write(`id: ${evt.id}\ndata: ${JSON.stringify(evt.data)}\n\n`); } catch { /* client gone */ }
+  };
+
+  // If the cursor predates the oldest retained event, the ring buffer overflowed and
+  // the client missed events. Tell it explicitly so it can refetch full state rather
+  // than silently rendering a hole.
+  if (after > 0 && after < run.firstId - 1) {
+    try { res.write(`data: ${JSON.stringify({ type: "resync" })}\n\n`); } catch {}
+  }
+  for (const evt of run.events) if (evt.id > after) write(evt);
+
+  if (run.done) return res.end();   // nothing live left — replay was the whole story
+
+  run.subscribers.add(write);
+  if (run.graceTimer) { clearTimeout(run.graceTimer); run.graceTimer = undefined; }
+
+  const heartbeat = setInterval(() => {
+    try { res.write(`:heartbeat\n\n`); } catch { clearInterval(heartbeat); }
+  }, 5000);
+
+  res.on("close", () => {
+    clearInterval(heartbeat);
+    run.subscribers.delete(write);
+    // Last client left: don't kill the process — keep it alive briefly so a refresh
+    // reconnects to the same run instead of starting over.
+    if (run.subscribers.size === 0 && !run.done) {
+      run.graceTimer = setTimeout(() => {
+        if (run.subscribers.size === 0 && !run.proc.killed) {
+          try { process.kill(-run.proc.pid!, "SIGTERM"); } catch { run.proc.kill(); }
+        }
+      }, GRACE_MS);
+    }
+  });
+});
+```
+
+**Why this is the default for anything non-trivial:** the per-request SSE pattern is
+fine for short one-shots, but the moment a run takes long enough that a user might
+reload, switch tabs, or lose signal, the event log is what keeps the experience
+whole. It also gives you multi-tab for free (every tab is just another subscriber)
+and a natural place to persist transcripts.
+
+**The four load-bearing pieces:**
+- **Monotonic ids + cursor replay** — the client sends its last-seen id (via `?after=`
+  or the `Last-Event-ID` header) and gets exactly the gap. This is what makes reloads
+  seamless.
+- **Grace period before teardown** — without it, the `close` that fires on reload kills
+  the process before the reload's new connection arrives. With it, the run survives the
+  blink between disconnect and reconnect.
+- **Resync marker on overflow** — a bounded ring buffer can age out events a slow client
+  hasn't seen yet. Emitting a `resync` event turns a silent data hole into a recoverable
+  "refetch full state" signal.
+- **Snapshot-then-live (optional upgrade)** — for stateful apps, send a full state
+  snapshot first, then live deltas. The snapshot *is* the catch-up cache, so subscribers
+  never need to replay from event zero.
+
+**Don't do this:**
+- Don't reuse the per-request `res` as the stream owner. The owner is the background
+  parser writing to the log; `res` objects come and go as clients connect and reconnect.
+- Don't kill the process on the first `res.on("close")` — that defeats the entire
+  pattern. Only the grace timer (or an explicit interrupt) kills it.
+- Don't forget the `ownerSessionId` check on the subscribe endpoint — a run id is a
+  capability; without the check, any authenticated user could read another user's stream.
+
+**Frontend:** consume `/api/runs/:id/events` with `fetch()` + `ReadableStream` (or
+`EventSource` for GET) exactly as in [Frontend Integration](#frontend-integration),
+but persist the last `id:` seen (e.g. in `sessionStorage`) and pass it as `?after=` on
+reconnect. On a `{type:"resync"}` event, clear local state and refetch the run's current
+state. Store the `runId` (in the URL or `sessionStorage`) so a full page reload can
+re-attach to the in-flight run.
+
+---
+
+## Pattern: Interrupting a Run
+
+A real Claude Code session stops on Ctrl+C. A web app should give the user the same
+power — a Stop button that actually halts a runaway or wrong-headed agent. Shipping
+an app with no interrupt (or a button that silently does nothing) is a real UX
+regression, not a minor omission: the user's only recourse becomes closing the tab.
+
+Interrupt by signalling the process *group*, not just the direct child. Send `SIGINT`
+first so Claude can finish the current tool call and emit a final `result`; escalate to
+`SIGKILL` only if it ignores the signal (a stuck `Bash` grandchild can keep the group
+alive). This builds on the run registry from the Reconnect-Safe Streaming pattern.
+
+```typescript
+app.post("/api/runs/:id/interrupt", requireAuth, (req: any, res) => {
+  const run = runs.get(req.params.id);
+  if (!run) return res.status(404).json({ error: "No such run" });
+  if (run.ownerSessionId !== req.cookies[SESSION_COOKIE_NAME]) return res.status(403).json({ error: "Forbidden" });
+  if (run.done) return res.json({ ok: true, alreadyDone: true });
+
+  // Mark it interrupted BEFORE signalling, so the close handler treats the non-zero
+  // exit as expected and the UI shows "Stopped", not "Error".
+  run.interrupted = true;
+  append(run, { type: "interrupted" });
+
+  // detached: true (set at spawn) makes -pid address the whole group, so SIGINT
+  // reaches Bash/MCP tool subtrees too — not just the claude process.
+  try { process.kill(-run.proc.pid!, "SIGINT"); } catch { run.proc.kill("SIGINT"); }
+
+  // Escalate if SIGINT is ignored within a grace window.
+  const force = setTimeout(() => {
+    if (!run.proc.killed) {
+      try { process.kill(-run.proc.pid!, "SIGKILL"); } catch { run.proc.kill("SIGKILL"); }
+    }
+  }, 5000);
+  run.proc.on("close", () => clearTimeout(force));
+
+  res.json({ ok: true });
+});
+```
+
+**Interrupt vs failure.** The distinction matters for the UI. A user stop and a model
+overload both end in a non-zero exit, but they should not look the same to the person
+watching. Setting `run.interrupted` and emitting an `interrupted` event lets the
+frontend render "Stopped" cleanly, while the `close` handler in the streaming pattern
+skips its "exited before producing output" error for interrupted runs.
+
+**Frontend:** a Stop button (shown while the run is live) `POST`s to
+`/api/runs/:id/interrupt`. The client doesn't wait on the response to update — the
+`interrupted` event already arriving over the event stream is the source of truth, so
+the button reacts the same whether the user has one tab open or three.
+
+**WebSocket variant:** if you're on the WebSocket session pattern instead, the same
+logic applies — on an `{action:"interrupt"}` message, `process.kill(-activeProc.pid!, "SIGINT")`
+the active process and let the `close` handler null it out so the next turn respawns.
 
 ---
 
