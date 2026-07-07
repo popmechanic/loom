@@ -204,7 +204,7 @@ drag-and-drop. A code assistant might need the full set.
 Desktop simplifies auth (no OAuth needed) but cost and permissions still matter:
 
 - **Budget**: `--max-budget-usd` caps spending per task (print mode only). What's appropriate? $0.50 for quick analysis, $5 for deep codebase review. Pair with `--max-turns` to bound cost *and* loop count.
-- **Model**: Haiku 4.5 for fast/cheap, Sonnet 4.6 for balanced, Opus 4.8 for best quality; `fable` (Fable 5) is the most capable alias — enable it for the hardest agentic work once it's available on your plan. `--fallback-model sonnet,haiku` (comma-separated, tried in order) for reliability.
+- **Model**: `haiku` for fast/cheap, `sonnet` for balanced, `opus` for best quality; `fable` is the most capable alias — enable it for the hardest agentic work once it's available on your plan. Aliases resolve to the latest generation of each tier. `--fallback-model sonnet,haiku` (comma-separated, tried in order) for reliability.
 - **Reasoning depth**: `--effort low|medium|high|xhigh|max` is a separate axis from the model. `xhigh` is Claude Code's own default for coding/agentic work; use `low`/`medium` for quick extraction.
 - **Permissions**: Use `--permission-mode bypassPermissions` with explicit `--tools` list. `dontAsk` auto-denies anything not whitelisted, but also blocks reads outside the project directory — meaning dropped files from ~/Desktop won't be accessible. `bypassPermissions` is safer for desktop apps where you control the prompt.
 - **Turn limit**: `--max-turns` prevents runaway agent loops.
@@ -235,7 +235,7 @@ Each event maps to an RPC message:
 | `assistant` (text content block) | `token` | Complete text for thinking models |
 | `stream_event` (content_block_delta) | `token` | Incremental for non-thinking models |
 | `assistant` (tool_use content block) | `toolUse` | Tool invocation |
-| `tool_result` | `toolResult` | Tool output |
+| `user` (`tool_result` block) | `toolResult` | Tool output |
 | `result` (subtype: success) | `done` | Session complete with cost |
 | parse error / process crash | `error` | Process failure |
 

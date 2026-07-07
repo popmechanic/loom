@@ -8,6 +8,7 @@ Core server-side code patterns for Loom web apps — shared utilities, communica
   - [cleanEnv()](#cleanenv)
   - [createStreamParser()](#createstreamparser)
   - [spawnEnvForUser()](#spawnenvforuser)
+  - [Spawn isolation](#spawn-isolation)
 - [Server Setup](#server-setup)
 - [Pattern: REST Endpoint](#pattern-rest-endpoint)
 - [Pattern: SSE Streaming](#pattern-sse-streaming)
@@ -77,8 +78,8 @@ Buffer stdout chunks into complete JSON lines.
 
 TCP delivers data in arbitrary chunks. A JSON line can split across two
 `data` events. Without buffering, the first half fails `JSON.parse` and
-gets silently discarded. Both Julian and vibes-skill use this identical
-buffer-and-split pattern.
+gets silently discarded. Production Loom apps independently converge on
+this same buffer-and-split pattern.
 
 ```typescript
 function createStreamParser(onEvent: (event: any) => void) {
@@ -123,6 +124,33 @@ function spawnEnvForUser(session: UserSession): NodeJS.ProcessEnv {
 }
 ```
 
+### Spawn isolation
+
+Two decisions belong on every spawn alongside `env` — the patterns below omit
+them for brevity, but apply both in a real app:
+
+```typescript
+const proc = spawn("claude", [
+  ...args,
+  // Exclude the host account's settings layers. A spawned claude -p otherwise
+  // inherits the server account's CLAUDE.md, hooks, plugins, and MCP servers —
+  // whatever happens to be installed on the box becomes part of your app.
+  // App-owned config (e.g. the HTTP-hook wiring in advanced-patterns.md) still
+  // loads when passed explicitly via --settings; verified to work together.
+  "--setting-sources", "",
+], {
+  cwd: userWorkDir,   // per-user or per-run directory — never the server's own cwd
+  env: spawnEnvForUser(session),
+  detached: true,
+});
+```
+
+`cwd` is the filesystem boundary between users. Without it, every user's
+process runs in the server's working directory, and one user's Claude can read
+files another user's session wrote there. Use a per-run temp directory for
+stateless endpoints (`mkdtempSync`, cleaned up on close) and a stable per-user
+directory for apps with persistent file state.
+
 ---
 
 ## Server Setup
@@ -162,7 +190,39 @@ Someone triggers an action → server calls Claude → returns JSON.
 
 ```typescript
 // Uses Server Setup block — app, express.json(), etc. already defined.
-import { execFileSync } from "child_process";
+import { spawn } from "child_process";
+
+// Run a one-shot claude -p and collect stdout. Async on purpose: a synchronous
+// call (execFileSync) would block the Node event loop until Claude finishes —
+// freezing every other user's requests, SSE heartbeats, and OAuth exchanges
+// for up to the full timeout. Never spawn Claude synchronously in a server.
+function runClaude(
+  args: string[],
+  stdin: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs = 60000,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // detached: own process group, so the timeout kill reaches tool subtrees too
+    const proc = spawn("claude", args, { stdio: ["pipe", "pipe", "pipe"], detached: true, env });
+    const killProc = () => { try { process.kill(-proc.pid!, "SIGTERM"); } catch { proc.kill(); } };
+    const timer = setTimeout(() => { killProc(); reject(new Error("Claude timed out")); }, timeoutMs);
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (c) => { stdout += c.toString(); });
+    proc.stderr.on("data", (c) => { stderr += c.toString(); });
+    proc.on("error", (err) => { clearTimeout(timer); reject(err); });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderr.trim() || `Claude exited with code ${code}`));
+      resolve(stdout);
+    });
+    // Guard stdin writes — without this, EPIPE crashes the server process
+    proc.stdin.on("error", () => {});
+    proc.stdin.write(stdin);
+    proc.stdin.end();
+  });
+}
 
 app.post("/api/analyze", requireAuth, async (req: any, res) => {
   try {
@@ -189,30 +249,35 @@ app.post("/api/analyze", requireAuth, async (req: any, res) => {
   });
 
   try {
-    const result = execFileSync("claude", [
+    const raw = await runClaude([
       "-p", "--model", "sonnet", "--output-format", "json",
       "--permission-mode", "dontAsk",
       "--json-schema", schema, "--tools", "", "--no-session-persistence"
-    ], { input: `${task}\n\n${content}`, encoding: "utf-8", timeout: 60000, env: spawnEnvForUser(req.userSession) });
+    ], `${task}\n\n${content}`, spawnEnvForUser(req.userSession));
 
-    const parsed = JSON.parse(result);
+    const parsed = JSON.parse(raw);
     if (parsed.is_error) {
-      return res.status(502).json({ error: parsed.result });
+      // parsed.result can be null (e.g. turn-limit exhaustion) — fall back
+      return res.status(502).json({ error: parsed.result ?? "Claude reported an error" });
     }
     res.json(parsed.structured_output);
   } catch (e: any) {
-    // execFileSync throws on non-zero exit and timeout
-    const stderr = e.stderr?.toString().trim();
-    console.error(`[claude] exit ${e.status}, stderr: ${stderr}`);
-    res.status(502).json({ error: stderr || "Claude process failed" });
+    // runClaude rejects on non-zero exit, spawn failure, and timeout
+    console.error(`[claude] ${e.message}`);
+    res.status(502).json({ error: e.message || "Claude process failed" });
   }
 });
 ```
 
 **Don't do this:**
-- Don't use `execSync("claude -p ...")` with string interpolation — use
-  `execFileSync` with an args array. Shell strings break on special characters,
-  are injection-vulnerable, and fail silently on quoting errors.
+- Don't spawn Claude synchronously (`execFileSync`, `execSync`) in a server
+  handler. A synchronous spawn blocks the whole Node event loop until Claude
+  returns — every other user's requests, streams, and auth flows freeze for up
+  to the full timeout. Synchronous spawning is only acceptable in single-user
+  CLI scripts, never in a multi-user server.
+- Don't use `execSync("claude -p ...")` with string interpolation — pass an
+  args array. Shell strings break on special characters, are
+  injection-vulnerable, and fail silently on quoting errors.
 - Don't read `structured_output` without checking `is_error` first — when
   Claude hits a tool failure, `structured_output` is `null`.
 - Don't skip env setup — always use `spawnEnvForUser()` before spawning.
@@ -290,7 +355,7 @@ app.post("/api/stream", requireAuth, async (req: any, res) => {
         // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
         send({ type: "warning", message: "Task incomplete — reached turn limit" });
       } else if (event.is_error) {
-        send({ type: "error", message: event.result });
+        send({ type: "error", message: event.result ?? "Task failed" });
       } else {
         send({ type: "done" });
       }
@@ -456,7 +521,7 @@ wss.on("connection", (ws: any) => {
           // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
           ws.send(JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" }));
         } else if (event.is_error) {
-          ws.send(JSON.stringify({ type: "error", message: event.result }));
+          ws.send(JSON.stringify({ type: "error", message: event.result ?? "Task failed" }));
         } else {
           ws.send(JSON.stringify({ type: "done" }));
         }
@@ -583,7 +648,7 @@ app.post("/api/jobs", requireAuth, async (req: any, res) => {
         // is_error: true; check subtype first — error_max_turns is a turn-limit warning, not a hard failure
         jobs.set(jobId, { ...job, status: "incomplete", result: event, finishedAt: Date.now() });
       } else if (event.is_error) {
-        jobs.set(jobId, { ...job, status: "failed", error: event.result, finishedAt: Date.now() });
+        jobs.set(jobId, { ...job, status: "failed", error: event.result ?? "Task failed", finishedAt: Date.now() });
       } else {
         jobs.set(jobId, { ...job, status: "complete", result: event, finishedAt: Date.now() });
       }
@@ -654,6 +719,16 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
     return res.status(400).json({ error: `Too many items (max ${MAX_ITEMS})` });
   }
 
+  // Output shape for each item — design it to match the UI you'll render.
+  const schema = JSON.stringify({
+    type: "object",
+    properties: {
+      summary: { type: "string" },
+      score: { type: "number" },
+    },
+    required: ["summary"],
+  });
+
   // Bounded pool: at most CONCURRENCY claude processes alive at once.
   async function mapWithConcurrency<T, R>(arr: T[], limit: number, fn: (item: T, i: number) => Promise<R>) {
     const results: PromiseSettledResult<R>[] = new Array(arr.length);
@@ -694,7 +769,7 @@ app.post("/api/batch", requireAuth, async (req: any, res) => {
           if (parsed.subtype === "error_max_turns") {
             reject(new Error("Task incomplete — reached turn limit"));
           } else if (parsed.is_error) {
-            reject(new Error(parsed.result));
+            reject(new Error(parsed.result ?? "Task failed"));
           } else {
             resolve(parsed.structured_output);
           }
@@ -753,6 +828,7 @@ interface Run {
   firstId: number;            // oldest id still retained — for overflow detection
   subscribers: Set<(e: LoggedEvent) => void>;
   done: boolean;
+  gotResult: boolean;         // a result event arrived — close without one is a crash
   interrupted?: boolean;      // set by the interrupt pattern below
   ownerSessionId: string;
   graceTimer?: NodeJS.Timeout;
@@ -785,7 +861,7 @@ app.post("/api/runs", requireAuth, async (req: any, res) => {
 
   const run: Run = {
     proc, events: [], nextId: 1, firstId: 1, subscribers: new Set(),
-    done: false, ownerSessionId: req.cookies[SESSION_COOKIE_NAME],
+    done: false, gotResult: false, ownerSessionId: req.cookies[SESSION_COOKIE_NAME],
   };
   runs.set(runId, run);
   res.json({ runId });   // client immediately opens GET /api/runs/:id/events
@@ -798,18 +874,20 @@ app.post("/api/runs", requireAuth, async (req: any, res) => {
         if (block.type === "tool_use") append(run, { type: "tool", name: block.name });
       }
     } else if (event.type === "result") {
+      run.gotResult = true;
       // check subtype before is_error — error_max_turns is a warning, not a failure
       if (event.subtype === "error_max_turns") append(run, { type: "warning", message: "Task incomplete — reached turn limit" });
-      else if (event.is_error) append(run, { type: "error", message: event.result });
+      else if (event.is_error) append(run, { type: "error", message: event.result ?? "Task failed" });
       else append(run, { type: "done" });
     }
   });
   proc.stdout.on("data", parse);
   proc.stderr.on("data", (c) => { const m = c.toString().trim(); if (m) console.error(`[claude stderr] ${m}`); });
   proc.on("close", (code) => {
-    // A user interrupt is not a failure — the interrupt pattern already logged it.
-    if (run.nextId === 1 && !run.interrupted) {
-      append(run, { type: "error", message: `Claude exited with code ${code} before producing output` });
+    // No result event = crash, whether it died instantly or mid-stream. A user
+    // interrupt is not a failure — the interrupt pattern already logged it.
+    if (!run.gotResult && !run.interrupted) {
+      append(run, { type: "error", message: `Claude exited with code ${code} before completing` });
     }
     run.done = true;
     append(run, { type: "closed" });
@@ -971,13 +1049,14 @@ edits a rendered file, a mid-stream or truncated write produces malformed output
 a validation step that bad output goes straight into the preview iframe — white-screening
 it or worse, causing the page to throw — instead of degrading gracefully.
 
-**The fix:** after each `tool_result` event that targets the rendered file, syntax-check
-the file before swapping it into the preview. If it passes, emit `preview_reload`; if not,
-keep the last-known-good render and emit `preview_reload_failed` with the error. Also
+**The fix:** after each completed Write/Edit tool call, syntax-check the file before
+swapping it into the preview. If it passes, emit `preview_reload`; if not, keep the
+last-known-good render and emit `preview_reload_failed` with the error. Also
 mtime-gate it so back-to-back tool calls on different files don't produce spurious reloads.
 
-Derived from: `tool_result` events (the stream event that signals a Write/Edit completed).
-Source: VibesOS `ws.ts` / `claude-bridge.ts`.
+Derived from: `tool_result` blocks inside `user` events (the stream signal that a
+Write/Edit completed). Those blocks carry only `tool_use_id` — track the tool name
+from the earlier `assistant` `tool_use` block so you know which results are writes.
 
 ```typescript
 import { statSync, readFileSync } from "fs";
@@ -1026,15 +1105,25 @@ function validateAndMaybeReload(send: (payload: unknown) => void) {
   }
 }
 
-// Hook into the stream parser. Call validateAndMaybeReload after each tool_result
-// whose tool_name is "Write" or "Edit".
+// Hook into the stream parser. tool_result blocks arrive inside user events and
+// carry only tool_use_id — remember each tool_use's name so a later result can be
+// matched back to Write/Edit.
+const pendingTools = new Map<string, string>(); // tool_use_id -> tool name
+
 const parse = createStreamParser((event) => {
   // ... token/result handling unchanged ...
-  if (
-    event.type === "tool_result" &&
-    (event.tool_name === "Write" || event.tool_name === "Edit")
-  ) {
-    validateAndMaybeReload(send);
+  if (event.type === "assistant" && event.message?.content) {
+    for (const block of event.message.content) {
+      if (block.type === "tool_use") pendingTools.set(block.id, block.name);
+    }
+  }
+  if (event.type === "user" && event.message?.content) {
+    for (const block of event.message.content) {
+      if (block.type !== "tool_result") continue;
+      const name = pendingTools.get(block.tool_use_id);
+      pendingTools.delete(block.tool_use_id);
+      if (name === "Write" || name === "Edit") validateAndMaybeReload(send);
+    }
   }
 });
 ```
@@ -1070,8 +1159,6 @@ activity but never lies by claiming completion.
 4. **Hard-silence timeout** — a safety backstop distinct from `--max-turns`: kill the
    process if it has emitted nothing for N seconds. This catches hangs that
    `--max-turns` never reaches (the process is alive but stuck, not taking turns).
-
-Source: VibesOS `event-translator.ts`, `claude-bridge.ts`.
 
 ```typescript
 // Track progress state alongside the stream parser.
@@ -1156,7 +1243,7 @@ const parse = createStreamParser((event) => {
     if (event.subtype === "error_max_turns") {
       send({ type: "warning", message: "Task incomplete — reached turn limit" });
     } else if (event.is_error) {
-      send({ type: "error", message: event.result });
+      send({ type: "error", message: event.result ?? "Task failed" });
     } else {
       send({ type: "done" });
     }
@@ -1194,7 +1281,6 @@ replay unconditionally on every fresh process.
 
 For the full pattern (append-only event log, projection tables, atomic resume-pointer
 writes) see `references/advanced-patterns.md#persistent-session-long-lived-process`.
-Source: metrc `budget.ts`.
 
 ---
 
@@ -1207,21 +1293,22 @@ Claude emits newline-delimited JSON events. The full event sequence is:
 system (init) → stream_event (message_start) → stream_event (content_block_start)
 → stream_event (content_block_delta) ×N → stream_event (content_block_stop)
 → assistant (complete block) → stream_event (message_delta) → stream_event (message_stop)
+→ user (tool_result — after each tool call) → …repeat per turn…
 → rate_limit_event → result
 ```
 
-Without `--include-partial-messages`, only `system`, `assistant`, and `result`
-events appear — no token-level streaming. Always use `--include-partial-messages`
-for streaming patterns.
+Without `--include-partial-messages`, only `system`, `assistant`, `user`, and
+`result` events appear — no token-level streaming. Always use
+`--include-partial-messages` for streaming patterns.
 
 | Event Type | Shape | What It Means | Forward? |
 |------------|-------|---------------|----------|
 | `system` | `{type:"system", subtype:"init", session_id, model, tools, ...}` | Session started | Optional (extract session_id) |
 | `stream_event` | `{type:"stream_event", event:{type:"content_block_delta", delta:{text:"..."}}}` | Incremental token (requires `--include-partial-messages`) | Yes (live text) |
-| `assistant` | `{type:"assistant", message:{content:[{type:"text",text:"..."}, {type:"tool_use",...}], stop_reason:"end_turn"|"tool_use"|null}}` | Complete message with text and/or tool calls | Tool use only (text already streamed via `stream_event`) |
-| `tool_result` | `{type:"tool_result", tool_name, content, is_error}` | Tool execution completed (only appears when tools are used) | Optional (show tool output or detect tool failures via `is_error`) |
-| `compact` | `{type:"compact"}` | Context window compacted (only in long sessions) | No (internal) |
-| `rate_limit_event` | `{type:"rate_limit_event", rate_limit_info:{status, utilization, rateLimitType, isUsingOverage, resetsAt}}` | Rate limit status update | No (but log it — if `utilization` is high, consider adding delays between spawns) |
+| `assistant` | `{type:"assistant", message:{content:[{type:"text",text:"..."}, {type:"tool_use",id,...}], stop_reason:"end_turn"|"tool_use"|null}}` | Complete message with text and/or tool calls | Tool use only (text already streamed via `stream_event`) |
+| `user` | `{type:"user", message:{content:[{type:"tool_result", tool_use_id, content, is_error?}]}, tool_use_result:{...}}` | Tool execution completed (only appears when tools are used). There is **no** top-level `tool_result` event type, and no tool name on the result — correlate `tool_use_id` with the `id` of the earlier `tool_use` block | Optional (show tool output or detect tool failures via `is_error` on the block) |
+| `system` (subtype `compact_boundary`) | `{type:"system", subtype:"compact_boundary", ...}` | Context window compacted (only in long sessions) | No (internal) |
+| `rate_limit_event` | `{type:"rate_limit_event", rate_limit_info:{status, rateLimitType, resetsAt, isUsingOverage, overageStatus, overageResetsAt}}` | Rate limit status — fires on essentially every run; `status:"allowed"` is the normal case | No (log it; alert only if `status` is not `"allowed"`) |
 | `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error, stop_reason:"end_turn"|"max_turns", session_id, num_turns, duration_ms, total_cost_usd}` | Session complete | Yes (done signal) |
 
 **Notes on specific fields:**
@@ -1231,14 +1318,19 @@ for streaming patterns.
   `stop_reason` is available if you need finer distinctions.
 - `total_cost_usd` is present on `result` even for subscription users. It reflects
   internal accounting but is not meaningful for billing — do not surface it in the UI.
-- `rate_limit_event` appears between the last `assistant` and `result` events.
-  It's informational — no action needed unless `utilization` is consistently high,
-  in which case add a small delay between concurrent spawns to avoid hitting limits.
-- `tool_result` and `compact` are carried forward from the existing documentation.
-  They were not re-verified (the 2026-03-08 tests used `--tools ""`
-  and short prompts, so neither event would have appeared). Their shapes are
-  presumed accurate — they almost certainly exist when tools are active or
-  context compaction triggers.
+- `rate_limit_event` typically appears just before `result`. It fires on normal
+  runs too, so treat it as telemetry, not an error signal.
+- The `user` event's top-level `tool_use_result` field carries structured per-tool
+  metadata beyond the `tool_result` block — e.g. for Read/Write it includes
+  `{file: {filePath, content, numLines, ...}}`. Useful when you need to know *which
+  file* a tool touched without parsing the prompt-visible result text.
+- `result.permission_denials` is an array of `{tool_name, tool_use_id, tool_input}`
+  for every tool call the permission system auto-denied during the run. Log it
+  server-side — it's the precise signal that a task came back incomplete because
+  of tool permissions rather than model failure.
+- Streams also contain `system` events with subtypes like `status`,
+  `thinking_tokens`, and `hook_started`/`hook_response` (when hooks are
+  configured). Ignore subtypes you don't recognize; new ones appear over time.
 
 **Extended thinking models** (e.g., haiku-4.5) work correctly with this
 approach. With `--include-partial-messages`, extended thinking models emit
@@ -1282,7 +1374,7 @@ if (event.type === "result") {
     // is_error: true; check subtype first — surface as an "incomplete / hit turn limit" warning, not a hard error
     send({ type: "warning", message: "Task incomplete — reached turn limit" });
   } else if (event.is_error) {
-    send({ type: "error", message: event.result });
+    send({ type: "error", message: event.result ?? "Task failed" });
   } else {
     send({ type: "done" });
   }
@@ -1432,7 +1524,7 @@ all three are present:
        // is_error: true; check subtype first — surface as an "incomplete / hit turn limit" warning
        res.write(`data: ${JSON.stringify({ type: "warning", message: "Task incomplete — reached turn limit" })}\n\n`);
      } else if (event.is_error) {
-       res.write(`data: ${JSON.stringify({ type: "error", message: event.result })}\n\n`);
+       res.write(`data: ${JSON.stringify({ type: "error", message: event.result ?? "Task failed" })}\n\n`);
      } else {
        res.write(`data: ${JSON.stringify({ type: "done", data: event.structured_output })}\n\n`);
      }

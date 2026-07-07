@@ -43,15 +43,27 @@ rendering primitives if you have one; the event handling is identical.
 ## Live tool-call entries
 
 **Derived from:** `tool_use` blocks inside `assistant` events (the call: name +
-input) paired with the later `tool_result` event (the outcome). The server
-forwards `tool_use` blocks as they arrive (see the WebSocket pattern in
+input) paired with the later `tool_result` block (the outcome), which arrives
+inside a `user` event — there is no top-level `tool_result` event type. The
+server forwards `tool_use` blocks as they arrive (see the WebSocket pattern in
 `references/server-patterns.md#pattern-websocket-session`, which already sends
-`{ type: "tool", name, input }`); forward `tool_result` the same way.
+`{ type: "tool", name, input }`); extract and forward result blocks the same way:
+
+```typescript
+// Server side: surface each tool_result block as an app-level event.
+if (event.type === "user" && event.message?.content) {
+  for (const block of event.message.content) {
+    if (block.type === "tool_result") {
+      send({ type: "tool_result", tool_use_id: block.tool_use_id, is_error: block.is_error === true });
+    }
+  }
+}
+```
 
 A real session shows each tool call as its own entry — an icon, a one-line
 summary of what it's doing, and a status that starts *running* and settles to
 *done* or *failed* when the result lands. The one piece of plumbing that trips
-people up: a `tool_result` carries **only** the `tool_use.id`, not the name or
+people up: a `tool_result` block carries **only** `tool_use_id`, not the name or
 input. Correlate by id. Keep a map from `id → entry` so the result can find the
 entry it belongs to.
 
@@ -264,8 +276,12 @@ if (hookEvent.tool_name === "ExitPlanMode") {
   // Show the plan to the user as a card; collect their approve/reject out-of-band.
   broadcastToUI({ type: "plan", plan: hookEvent.tool_input.plan });
   return {
-    decision: "block",   // deny the tool call
-    reason: "Plan surfaced to the user. Wait for their feedback before executing.",
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",   // deny the tool call
+      permissionDecisionReason:
+        "Plan surfaced to the user. Wait for their feedback before executing.",
+    },
   };
 }
 ```
@@ -358,8 +374,9 @@ function renderContextMeter(usage, contextWindow) {
 }
 ```
 
-When the stream reports a context compaction (a `compact` event, or
-auto-compaction reflected in a later `result`'s usage dropping), surface that as
+When the stream reports a context compaction (a `system` event with subtype
+`compact_boundary`, or auto-compaction reflected in a later `result`'s usage
+dropping), surface that as
 a small "compacted" status next to the meter so the user understands why the
 window suddenly has room again.
 
@@ -409,10 +426,9 @@ a generic file thumbnail — the point of the grid is to confirm to the user
 
 ## Where these came from
 
-These rendering patterns are derived from t3code's
-`apps/web/src/components/chat/` reference implementation, which renders a full
-Claude Code session — tool calls, streaming input, reasoning, plans, diffs, and a
-context meter — in a custom web UI. The shape of each stream event is the
+These rendering patterns are derived from a production Loom app that renders a
+full Claude Code session — tool calls, streaming input, reasoning, plans, diffs,
+and a context meter — in a custom web UI. The shape of each stream event is the
 contract; how you render it is the app's choice. Treat the snippets here as the
 minimum that proves the event is wired up correctly, then style and elaborate to
 fit your app.

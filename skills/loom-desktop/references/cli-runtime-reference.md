@@ -423,10 +423,10 @@ claude -p --max-turns 10 "multi-step task"
 claude -p --model opus --fallback-model sonnet,haiku "important task"
 
 # Model selection for cost
-claude -p --model haiku "quick cheap task"     # Fast/cheap (Haiku 4.5)
-claude -p --model sonnet "standard task"        # Balanced (Sonnet 4.6)
-claude -p --model opus "complex task"           # Best quality (Opus 4.8)
-# claude -p --model fable "hardest agentic work" # Most capable (Fable 5) — uncomment when available on your plan
+claude -p --model haiku "quick cheap task"     # Fast/cheap
+claude -p --model sonnet "standard task"        # Balanced
+claude -p --model opus "complex task"           # Best quality
+# claude -p --model fable "hardest agentic work" # Most capable — uncomment when available on your plan
 
 # Reasoning effort: low | medium | high | xhigh | max
 claude -p --effort xhigh "agentic coding task"  # Claude Code's own default for coding/agentic work
@@ -472,7 +472,7 @@ classification and extraction.
 4. `structured_output` is separate from `result` in JSON output
 5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start). `--exclude-dynamic-system-prompt-sections` moves per-machine sections (cwd, env, git status) out of the cached prefix.
 6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
-7. **`dontAsk` without `--allowedTools`** = no tools at all. `dontAsk` auto-denies everything not explicitly allowed. Always pair with `--allowedTools` or `--tools`. Also, `dontAsk` blocks reads outside the project directory — prefer `bypassPermissions` for desktop apps.
+7. **`dontAsk` without `--allowedTools`** = incomplete results. Read-only tools inside the project directory still work, but Write/Edit/Bash — and reads outside the project directory (e.g. dropped files from ~/Desktop) — are auto-denied while the run still ends `is_error: false`. Denials are recorded in the result event's `permission_denials` array. Prefer `bypassPermissions` with an explicit `--tools` list for desktop apps.
 8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
 9. **User hooks bloat spawned processes** — `claude -p` loads `~/.claude/` hooks and settings by default, adding seconds of startup and massive prompt bloat. Fix: `--setting-sources ""` skips all user/project settings. Do NOT use `--no-user-config` — that flag doesn't exist.
 10. **`--tools ""` is fragile** — Empty string tools arg can cause ambiguous CLI behavior. For pure reasoning tasks, omit `--tools` entirely. For controlled tool access, use `--tools "Read,Glob"` with explicit list.

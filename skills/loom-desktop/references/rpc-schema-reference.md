@@ -312,7 +312,7 @@ Webview                        Bun                          claude -p
   │◄── token(text) ────────────│◄── stream_event delta ───────│
   │◄── status(tool_use) ───────│◄── tool_use block ───────────│
   │◄── toolUse(Read,...) ──────│                              │
-  │◄── toolResult(Read,...) ───│◄── tool_result ──────────────│
+  │◄── toolResult(Read,...) ───│◄── user (tool_result) ───────│
   │◄── status(running) ────────│                              │
   │◄── token(text) ────────────│◄── assistant text ───────────│
   │◄── done(cost,duration) ────│◄── result ───────────────────│

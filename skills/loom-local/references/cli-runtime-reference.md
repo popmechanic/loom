@@ -174,7 +174,7 @@ unless `--fork-session` is also specified.
 
 | Flag | Purpose |
 |------|---------|
-| `--model haiku\|sonnet\|opus` | Model selection (Haiku 4.5 / Sonnet 4.6 / Opus 4.8; `fable` = Fable 5 when available) |
+| `--model haiku\|sonnet\|opus` | Model selection — aliases resolve to the latest generation of each tier (`fable` = most capable, when available) |
 | `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order) |
 | `--effort low\|medium\|high\|xhigh\|max` | Control reasoning depth (`xhigh` = Claude Code's coding/agentic default) |
 | `--max-turns N` | Limit agentic iterations |
@@ -222,8 +222,10 @@ unless `--fork-session` is also specified.
 4. **Nesting guard**: Remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the
    child's environment (that's what `cleanEnv()` does). Do NOT filter all
    `CLAUDE*` vars.
-5. **`dontAsk` without `--allowedTools`** = silent failure. Claude can reason but
-   can't act. The result is empty with NO error.
+5. **`dontAsk` without `--allowedTools`** = incomplete results. Read-only tools
+   (Read, Glob, Grep) still work, but Write/Edit/Bash are auto-denied and the
+   run ends `is_error: false` with the work not done. Check the result event's
+   `permission_denials` array to detect it.
 6. **Stdout is chunked** — Buffer lines before parsing JSON (split on `\n`, keep
    the last incomplete fragment). Use `TextDecoder({ stream: true })` for UTF-8
    safety.

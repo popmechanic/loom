@@ -98,7 +98,7 @@ claude -p --output-format stream-json --verbose "Write a poem"
 
 Event sequence:
 ```
-{"type":"system","subtype":"init","session_id":"...","model":"claude-sonnet-4-6","tools":[...]}
+{"type":"system","subtype":"init","session_id":"...","model":"...","tools":[...]}
 {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
 {"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"...","num_turns":1}
 ```
@@ -177,15 +177,18 @@ claude -p --add-dir /data/shared --add-dir /tmp/uploads "analyze files"
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
-| `default` | Prompt on first use | Interactive |
+| `manual` | Prompt on first use (the interactive default; the older name `default` still parses but is no longer documented) | Interactive |
 | `plan` | Read-only, then implement | Analysis first |
-| `auto` | Classifier decides per action — auto-approves safe ones, prompts on the rest | Interactive/assisted (can still hang in a server when it decides to prompt) |
+| `auto` | Classifier decides per action — auto-approves safe ones, prompts on the rest | Interactive/assisted |
 | `acceptEdits` | Auto-approve file modifications | Trusted editing |
-| `dontAsk` | Auto-deny unless explicitly allowed | Safe mode (servers) |
+| `dontAsk` | Auto-deny unless explicitly allowed | Unattended servers |
 | `bypassPermissions` | Skip all checks | CI/CD, automation |
 
-For unattended server contexts, prefer `dontAsk` (paired with `--allowedTools`)
-over `auto` — `auto` can still decide to prompt, and there's no human to answer.
+Print mode never shows a prompt: in any mode that would prompt, the tool call
+is auto-denied instead and recorded in the result event's `permission_denials`
+array. For unattended server contexts, prefer `dontAsk` (paired with
+`--allowedTools`) — it tells the model the denial is final, so it reports
+clearly instead of asking for approval no one can give.
 
 Shorthand: `--dangerously-skip-permissions` = `--permission-mode bypassPermissions`
 
@@ -361,7 +364,11 @@ Configure in `.claude/settings.json`.
 ### Available events
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PostToolUseFailure`, `PermissionRequest`, `Notification`,
-`SubagentStart`, `SubagentStop`, `Stop`, `SessionEnd`
+`SubagentStart`, `SubagentStop`, `PreCompact`, `Stop`, `SessionEnd`
+
+To *observe* hook activity from a wrapping server without wiring endpoints,
+add `--include-hook-events` to a stream-json run — hook lifecycle events are
+then emitted inline in the output stream.
 
 ### Hook mechanics
 - Input: JSON on stdin with tool details, session ID, working directory
@@ -457,7 +464,8 @@ claude -p --max-turns 10 "multi-step task"
 # stops once spend would exceed this amount. Pair with --max-turns for unattended runs.
 claude -p --max-budget-usd 0.50 "bounded task"
 
-# Fallback model(s) for reliability — comma-separated, tried in order on overload
+# Fallback model(s) for reliability — comma-separated, tried in order on
+# overload (print mode only)
 claude -p --model opus --fallback-model sonnet,haiku "important task"
 
 # Safe mode — disables all customizations (CLAUDE.md, skills, plugins, hooks, MCP)
@@ -465,11 +473,12 @@ claude -p --model opus --fallback-model sonnet,haiku "important task"
 # in a clean baseline or to run untrusted prompts without extension interference.
 claude -p --safe-mode "troubleshoot clean baseline"
 
-# Model selection (aliases resolve to the current generation)
-claude -p --model haiku "quick extraction"      # Fastest, cheapest (Haiku 4.5)
-claude -p --model sonnet "standard task"         # Balanced default (Sonnet 4.6)
-claude -p --model opus "complex reasoning"       # Best quality (Opus 4.8)
-# claude -p --model fable "hardest agentic work" # Most capable (Fable 5) — uncomment when available on your plan
+# Model selection — aliases resolve to the latest generation of each tier,
+# so prefer them over pinned model IDs, which go stale
+claude -p --model haiku "quick extraction"      # Fastest, cheapest
+claude -p --model sonnet "standard task"         # Balanced default
+claude -p --model opus "complex reasoning"       # Best quality
+# claude -p --model fable "hardest agentic work" # Most capable — uncomment when available on your plan
 
 # Extended-context model aliases
 claude -p --model "sonnet[1m]" "long-context task"   # Sonnet with 1M-token context window
@@ -625,7 +634,7 @@ must supply context explicitly: `--system-prompt[-file]`,
 4. `structured_output` is separate from `result` in JSON output
 5. Context caching reduces cost on repeated runs (don't invalidate KV cache with dynamic timestamps at prompt start). For multi-user apps, add `--exclude-dynamic-system-prompt-sections` to move per-machine sections (cwd, env info, git status) out of the cached prefix so the cache is reused across users and machines.
 6. **Nesting guard**: When spawning `claude -p` from within Claude Code, remove `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` from the child's environment — these block nested Claude processes. Do NOT filter all `CLAUDE*` vars (that kills auth tokens).
-7. **`dontAsk` without `--allowedTools`** = silent failure. `dontAsk` auto-denies everything not explicitly allowed. Without `--allowedTools`, Claude has NO tools — it can reason but can't act. The result is an empty or incomplete response with NO error. Always pair `--permission-mode dontAsk` with `--allowedTools "Read,Bash,..."` or `--tools "Read,Bash,..."`.
+7. **`dontAsk` without `--allowedTools`** = incomplete results. `dontAsk` auto-denies any tool call that would need approval. Read-only tools (Read, Glob, Grep) still work — they never prompt — but Write/Edit/Bash are denied, and the run ends with `is_error: false` and the work not done. Every denial is recorded in the result event's `permission_denials` array (`{tool_name, tool_use_id, tool_input}`) — check it server-side. Always pair `--permission-mode dontAsk` with `--allowedTools "Read,Bash,..."` or `--tools "Read,Bash,..."`.
 8. **Stdout is chunked** — TCP delivers data in arbitrary chunks. Buffer lines before parsing JSON (split on `\n`, keep the last incomplete fragment). Use `TextDecoder({ stream: true })` not `chunk.toString()` for UTF-8 safety.
 9. **`--session-id` + `--continue` errors** — Combining `--session-id` with `--continue` or `--resume` requires `--fork-session`. For multi-turn conversations, use `--session-id` on the first turn only, then `--resume <id>` on subsequent turns.
 10. **Claude reads images and PDFs natively** — The Read tool handles PNG, JPG, JPEG, GIF, WebP, BMP, and PDF files. For apps that accept file uploads or drops, save binary files to a temp directory and pass the file path in the prompt — Claude will use its Read tool to analyze them visually. Clean up temp files after the Claude process exits.
@@ -635,4 +644,4 @@ must supply context explicitly: `--system-prompt[-file]`,
 14. **Session-id is scoped to the cwd-derived project directory** — A `session_id` created under one working directory won't resolve when `--resume` is run from a different directory. Resume from the same cwd, or use a session name (not UUID) to search across worktrees of the same repo. See Session Management.
 15. **Large system prompts belong in a file** — Inline `--system-prompt` text is passed as a shell argument; on most systems this caps around 2MB, and macOS has a lower effective limit for deeply nested arg strings. For system prompts 30KB or larger, use `--system-prompt-file` or `--append-system-prompt-file` to avoid arg-length errors.
 16. **Default output token ceiling can truncate large writes** — The default `CLAUDE_CODE_MAX_OUTPUT_TOKENS` may be too low for tasks that emit a single large file (e.g., a generated report or code file). Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000` (or higher) in the subprocess environment before the task begins.
-17. **`rate_limit_event` is a real stream-json event** — When the Claude API rate-limits a request mid-stream, it emits `{"type":"rate_limit_event"}`. Production stream parsers should handle it gracefully (e.g., pause and retry) rather than treating it as an unknown event to discard.
+17. **`rate_limit_event` is routine telemetry, not an error signal** — It fires on essentially every run with `rate_limit_info.status: "allowed"`. Log it if you want visibility into subscription utilization; alert only when `status` is something other than `"allowed"`. Don't treat its mere presence as a failure.

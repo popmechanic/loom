@@ -148,10 +148,10 @@ Local apps simplify security but don't eliminate it:
 
 | Need | Flag | Why |
 |------|------|-----|
-| Fast responses (<3s) | `--model haiku` | Classification, extraction, routing (Haiku 4.5) |
-| Good quality, reasonable speed | `--model sonnet` | Default for most apps (Sonnet 4.6) |
-| Best reasoning | `--model opus` | Complex analysis, code generation (Opus 4.8) |
-| Hardest agentic work | `--model fable` | Most capable (Fable 5) — enable when available on your plan |
+| Fast responses (<3s) | `--model haiku` | Classification, extraction, routing |
+| Good quality, reasonable speed | `--model sonnet` | Default for most apps |
+| Best reasoning | `--model opus` | Complex analysis, code generation |
+| Hardest agentic work | `--model fable` | Most capable — enable when available on your plan |
 | Reliability | `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order) |
 | Control reasoning depth | `--effort low\|medium\|high\|xhigh\|max` | `xhigh` = Claude Code's coding/agentic default |
 
@@ -173,12 +173,17 @@ HTTP, static files, and WebSockets natively.
 Every pattern runs Claude from a server — no human at a terminal to approve
 tool use. Two flags are non-negotiable:
 
-**`--permission-mode dontAsk`** — Nobody to click "approve." Without this flag,
-Claude hangs forever waiting for interactive input.
+**`--permission-mode dontAsk`** — Nobody to click "approve." Print mode never
+shows a prompt: a tool call that would need approval is auto-denied, and in the
+default mode Claude responds by *asking for permission* in its result text — a
+dead-end question no one can answer. `dontAsk` makes the denial final and the
+behavior predictable.
 
-**Critical:** Pair `--permission-mode dontAsk` with `--allowedTools` or `--tools`.
-Without allowed tools, `dontAsk` gives Claude no tools at all — it can reason
-but can't act, and the failure is silent (no error, just missing results).
+**Pair it with `--allowedTools` or `--tools`.** Under `dontAsk`, read-only
+tools (Read, Glob, Grep) still work, but Write/Edit/Bash are auto-denied unless
+allowed — the run ends `is_error: false` with the work not done. Every denial
+is recorded in the result event's `permission_denials` array; check it instead
+of treating an empty-handed result as success.
 
 **`--max-turns`** — Prevents conversational loops where Claude keeps trying
 approaches that won't work.
@@ -215,8 +220,12 @@ Claude emits newline-delimited JSON events:
 | `system` | `{type:"system", subtype:"init", session_id, model, tools}` | Optional (extract session_id) |
 | `stream_event` | `{type:"stream_event", event:{delta:{text:"..."}}}` | Yes (live text) |
 | `assistant` | `{type:"assistant", message:{content:[...]}}` | Tool use only (text already streamed) |
-| `tool_result` | `{type:"tool_result", tool_name, content, is_error}` | Optional |
-| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error}` | Yes (done signal) |
+| `user` | `{type:"user", message:{content:[{type:"tool_result", tool_use_id, content}]}}` | Optional (tool outcomes — match `tool_use_id` to the earlier `tool_use` block's `id`) |
+| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error, permission_denials}` | Yes (done signal) |
+
+There is no top-level `tool_result` event type — tool results arrive as `user`
+messages containing `tool_result` content blocks, which carry only
+`tool_use_id` (never the tool name).
 
 **Max-turns detection:** The `result` event has `subtype: "error_max_turns"`
 with `is_error: true` (verified on CLI v2.1.x). Check `subtype` **before**
@@ -252,7 +261,7 @@ These are silent-failure modes — things that break with NO error message:
 - [ ] `--include-partial-messages` is on every streaming spawn — without it, text dumps as a single block
 - [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
 - [ ] `cleanEnv()` is called on every `Bun.spawn`/`Bun.spawnSync` — without it, Claude refuses to start inside a Claude Code session
-- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
+- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — write/exec tools are otherwise auto-denied while the run still ends `is_error: false`; check `result.permission_denials` to catch it
 - [ ] `subtype === "error_max_turns"` is checked on result events — this fires with `is_error: true` (verified on CLI v2.1.x); check `subtype` **before** `is_error` or the generic error branch swallows it
 - [ ] Request body is parsed with `await req.json()` before accessing fields — without it, the spawn gets an empty prompt
 - [ ] `stdout` chunks are buffered into complete JSON lines before parsing — TCP delivers arbitrary chunk boundaries

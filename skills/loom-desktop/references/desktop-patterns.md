@@ -242,22 +242,26 @@ function deriveAndSendRPC(
       break;
     }
 
-    case "tool_result": {
-      const content = event.content ?? event.message?.content;
-      const text = typeof content === "string"
-        ? content
-        : Array.isArray(content)
-          ? content.map((b: any) => b.text ?? "").join("")
-          : JSON.stringify(content);
-      // tool_result carries the tool_use_id of the call it answers — look the
-      // tool name up by that id so parallel calls attribute correctly.
-      const toolUseId = event.tool_use_id ?? event.message?.tool_use_id;
-      rpc.sendProxy.toolResult({
-        taskId,
-        tool: toolNamesById.get(toolUseId) ?? "",
-        output: text.slice(0, 10000),
-        isError: !!event.is_error,
-      });
+    case "user": {
+      // Tool results arrive as user messages containing tool_result blocks —
+      // there is no top-level "tool_result" event type. Each block carries the
+      // tool_use_id of the call it answers — look the tool name up by that id
+      // so parallel calls attribute correctly.
+      const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
+      for (const block of blocks) {
+        if (block.type !== "tool_result") continue;
+        const text = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((b: any) => b.text ?? "").join("")
+            : JSON.stringify(block.content ?? "");
+        rpc.sendProxy.toolResult({
+          taskId,
+          tool: toolNamesById.get(block.tool_use_id) ?? "",
+          output: text.slice(0, 10000),
+          isError: !!block.is_error,
+        });
+      }
       currentState = "running";
       break;
     }
@@ -542,22 +546,26 @@ function spawnClaude(
         break;
       }
 
-      case "tool_result": {
-        const content = event.content ?? event.message?.content;
-        const text = typeof content === "string"
-          ? content
-          : Array.isArray(content)
-            ? content.map((b: any) => b.text ?? "").join("")
-            : JSON.stringify(content);
-        // Look the tool up by the tool_use_id this result answers, so parallel
-        // tool calls don't all attribute to the last-started tool.
-        const toolUseId = event.tool_use_id ?? event.message?.tool_use_id;
-        rpc.sendProxy.toolResult({
-          taskId,
-          tool: toolNamesById.get(toolUseId) ?? "",
-          output: text.slice(0, 10000),
-          isError: !!event.is_error,
-        });
+      case "user": {
+        // Tool results arrive as user messages containing tool_result blocks —
+        // there is no top-level "tool_result" event type. Look each tool up by
+        // the block's tool_use_id, so parallel tool calls don't all attribute
+        // to the last-started tool.
+        const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
+        for (const block of blocks) {
+          if (block.type !== "tool_result") continue;
+          const text = typeof block.content === "string"
+            ? block.content
+            : Array.isArray(block.content)
+              ? block.content.map((b: any) => b.text ?? "").join("")
+              : JSON.stringify(block.content ?? "");
+          rpc.sendProxy.toolResult({
+            taskId,
+            tool: toolNamesById.get(block.tool_use_id) ?? "",
+            output: text.slice(0, 10000),
+            isError: !!block.is_error,
+          });
+        }
         currentState = "running";
         break;
       }

@@ -899,7 +899,7 @@ app.post("/api/chat", requireProxyAuth, async (req: any, res) => {
 Notice that `requireProxyAuth` replaces `requireAuth` (the session-cookie
 middleware) — the proxy is now the auth layer, not the app's own session
 store. The app's job is to retrieve each user's Anthropic token by the
-identity the proxy has confirmed. Source: metrc `app/server/auth.ts`.
+identity the proxy has confirmed.
 
 ---
 

@@ -24,8 +24,8 @@ Advanced server-side patterns for Loom web apps — async extraction, persistent
 
 For lightweight data extraction tasks — form field suggestions, entity
 parsing, classification — spawn a one-shot Haiku process with no tools
-and a JSON schema. Async with a timeout kill, unlike the synchronous
-`execFileSync` REST pattern.
+and a JSON schema. Same async spawn-and-collect shape as the REST
+pattern's `runClaude()`, typed for extraction.
 
 ```typescript
 async function extract<T>(prompt: string, schema: object, session: UserSession, timeoutMs = 30000): Promise<T> {
@@ -56,7 +56,7 @@ async function extract<T>(prompt: string, schema: object, session: UserSession, 
       throw new Error(`Extraction failed (exit ${code}): ${stderr.slice(0, 200)}`);
     }
     const wrapper = JSON.parse(stdout);
-    if (wrapper.is_error) throw new Error(wrapper.result);
+    if (wrapper.is_error) throw new Error(wrapper.result ?? "Extraction failed");
     if (wrapper.structured_output) return wrapper.structured_output as T;
     try { return JSON.parse(wrapper.result) as T; } catch {
       throw new Error("Claude returned no structured_output and result was not valid JSON");
@@ -89,10 +89,12 @@ and steering an in-flight run are both the same `write({type:"user",...})` call.
 import { spawn, ChildProcess } from "child_process";
 
 // Map<sessionId, { proc, lastActivity }> — one entry per user session.
+// Named claudeProcs (not `sessions`) so it can't collide with the OAuth
+// session store from references/oauth-reference.md in the same server file.
 // Never share a proc across sessions: each user's CLAUDE_CODE_OAUTH_TOKEN is
 // injected at spawn time, so a shared proc would run all requests under
 // whichever user started it first.
-const sessions = new Map<string, { proc: ChildProcess; lastActivity: number }>();
+const claudeProcs = new Map<string, { proc: ChildProcess; lastActivity: number }>();
 
 function buildArgs(systemPrompt?: string): string[] {
   const args = [
@@ -108,14 +110,14 @@ function buildArgs(systemPrompt?: string): string[] {
 }
 
 function getOrStart(session: UserSession, systemPrompt?: string): { proc: ChildProcess; lastActivity: number } {
-  let s = sessions.get(session.id);
+  let s = claudeProcs.get(session.id);
   if (!s || s.proc.exitCode !== null) {
     const proc = spawn("claude", buildArgs(systemPrompt), {
       stdio: ["pipe", "pipe", "pipe"],
       env: spawnEnvForUser(session),
     });
     s = { proc, lastActivity: Date.now() };
-    sessions.set(session.id, s);
+    claudeProcs.set(session.id, s);
 
     const parse = createStreamParser((event) => {
       if (event.type === "stream_event" && event.event?.delta?.text) {
@@ -130,7 +132,7 @@ function getOrStart(session: UserSession, systemPrompt?: string): { proc: ChildP
         if (event.subtype === "error_max_turns") {
           broadcast(session.id, { type: "warning", message: "Task incomplete — reached turn limit" });
         } else if (event.is_error) {
-          broadcast(session.id, { type: "error", message: event.result });
+          broadcast(session.id, { type: "error", message: event.result ?? "Task failed" });
         } else {
           broadcast(session.id, { type: "done" });
         }
@@ -138,13 +140,13 @@ function getOrStart(session: UserSession, systemPrompt?: string): { proc: ChildP
     });
     proc.stdout!.on("data", parse);
     proc.stderr!.on("data", (chunk) => console.error(`[claude:${session.id}] ${chunk}`));
-    proc.on("close", () => { sessions.delete(session.id); });
+    proc.on("close", () => { claudeProcs.delete(session.id); });
   }
   return s;
 }
 
 function sendMessage(session: UserSession, text: string): boolean {
-  const s = sessions.get(session.id);
+  const s = claudeProcs.get(session.id);
   if (!s || s.proc.exitCode !== null) return false;
   const jsonl = JSON.stringify({
     type: "user",
@@ -157,17 +159,17 @@ function sendMessage(session: UserSession, text: string): boolean {
 }
 
 function endSession(session: UserSession) {
-  const s = sessions.get(session.id);
-  if (s) { s.proc.kill(); sessions.delete(session.id); }
+  const s = claudeProcs.get(session.id);
+  if (s) { s.proc.kill(); claudeProcs.delete(session.id); }
 }
 
 // Inactivity timeout — kill idle sessions after 15 minutes
 setInterval(() => {
   const now = Date.now();
-  for (const [id, s] of sessions) {
+  for (const [id, s] of claudeProcs) {
     if (now - s.lastActivity > 15 * 60 * 1000) {
       s.proc.kill();
-      sessions.delete(id);
+      claudeProcs.delete(id);
     }
   }
 }, 60000);
@@ -239,6 +241,12 @@ start/end. This gives your server reliable, typed events without parsing
 stdout. HTTP hooks **supplement** stdout streaming (you still need
 `stream-json` for token-by-token text), but they're more reliable for
 lifecycle events because they come from Claude Code's own event system.
+
+If you only need to *observe* tool lifecycle — no approval decisions — you can
+skip the endpoints entirely: add `--include-hook-events` to the stream-json
+spawn and hook lifecycle events arrive inline on stdout alongside the other
+stream events. Reach for HTTP hooks when the server must *answer* (permission
+approval, plan gating), not just watch.
 
 ### Configuration
 
@@ -450,14 +458,47 @@ async function respondPermission(requestId, approved) {
   Claude Code sends `PreToolUse` events for tools that need approval.
 - The `session_id` in the hook POST matches the session you get from
   `--session-id` or the `system.init` event in stream-json output. Use this
-  to route permission requests to the correct browser tab.
+  to route permission requests to the correct browser tab. The POST body also
+  carries `tool_use_id`, `cwd`, and `permission_mode`.
 - If no browser is connected, auto-deny for safety. Don't let tool calls
   hang forever waiting for a user who isn't there.
+- An unreachable hook endpoint **fails open** — see "Hardening the Approval
+  Gate" below before trusting this with real side effects.
 
 ### Hardening the Approval Gate
 
-The flow above is the happy path. Three failure modes turn it from a demo into
+The flow above is the happy path. Four failure modes turn it from a demo into
 something you can trust with real side effects.
+
+**The gate fails open when the endpoint is unreachable.** If your server isn't
+listening — wrong port in the hook config, a typo'd URL, the app crashed and
+restarted on a different port — the HTTP hook's connection failure is treated
+as a non-blocking hook error and the tool call **proceeds as if no gate
+existed**. Nothing surfaces in the stream or the result; from the outside, an
+unreachable gate is indistinguishable from no gate. Two mitigations, both
+cheap:
+
+- **Self-check at startup.** Before spawning any Claude process, POST a
+  synthetic payload to your own hook URL and require a round-trip:
+
+  ```typescript
+  async function verifyHookEndpoint(url: string) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "__selfcheck__", tool_input: {} }),
+    });
+    if (!resp.ok) throw new Error(`Hook endpoint unreachable (${resp.status}) — refusing to spawn Claude`);
+  }
+  // In the hook handler: answer __selfcheck__ with an immediate deny,
+  // without pushing anything to a browser.
+  ```
+
+- **Bound the blast radius.** The approval gate is the *second* line of
+  defense; `--allowedTools` / `--disallowedTools` are the first (see
+  [Securing Tool Access](#securing-tool-access-a-gate-is-not-enough)). A
+  process that can only reach Read/Glob/Grep does bounded damage even on the
+  day the gate silently isn't there.
 
 **Don't auto-deny a pending approval on a timer.** The sample resolves to `deny` after
 90s, but auto-denying a sensitive write *because the human was still reading it* is
@@ -593,10 +634,7 @@ each user in a per-user working directory, persist that path alongside the resum
 from "transcript as a side-effect log" to an append-only event log as the source of truth,
 with projection tables (current messages, tool state) rebuilt from it. A crash recovers by
 replaying events into the projections — no half-applied state, and every change is
-attributable. t3code uses this shape in its `persistence/` layer; reach for it when you
-need durability you can audit, not just resume.
-
-> Sources: skylights `session-store.ts`, t3code `persistence/`.
+attributable. Reach for it when you need durability you can audit, not just resume.
 
 ---
 
@@ -605,9 +643,10 @@ need durability you can audit, not just resume.
 The browser-approval gate above is necessary but not sufficient. The hard lesson:
 **some built-in tools can execute without routing through the approval gate.** In the
 Agent SDK, `Bash` and `ToolSearch` were observed running *without* invoking the
-`canUseTool` callback — the gate you carefully built never saw them. The same risk exists
-for any approval mechanism: do not assume installing a gate means every tool call passes
-through it.
+`canUseTool` callback — the gate you carefully built never saw them. And the HTTP-hook
+gate fails open outright when its endpoint is unreachable (see "Hardening the Approval
+Gate" above). The same risk exists for any approval mechanism: do not assume installing
+a gate means every tool call passes through it.
 
 Spell out the concrete risk so it's not abstract: an ungated `Bash` call can read the
 in-environment credential and exfiltrate or misuse it — `echo $CLAUDE_CODE_OAUTH_TOKEN`,
@@ -656,8 +695,6 @@ The classification feeds your gate (auto-allow only `read`, prompt for `write`, 
 prompt or deny `sensitive`) — but it's the *second* line. The first is keeping `Bash` off
 the tool list entirely unless a feature genuinely needs it.
 
-> Sources: skylights `mcp.ts`, `policy/classify.ts`.
-
 ---
 
 ## Injecting a Scoped Tool Server for the Agent
@@ -702,8 +739,6 @@ Scope each token to a single run and drop the hash when the run ends, so a leake
 from one session can't reach another. Other local processes that don't hold the token get
 a flat `401`.
 
-> Sources: t3code `mcp/McpHttpServer.ts`, `McpSessionRegistry.ts`.
-
 ---
 
 ## Prompt-Injection Hardening for Retrieved/Untrusted Content
@@ -743,8 +778,6 @@ Validate untrusted input at the boundary too, before it ever reaches the model �
 it with `--json-schema`/`--allowedTools` so an adversarial passage can only produce data
 in your shape and can't reach a tool.
 
-> Sources: metrc `verify_themis.py`, `verify_l2_prompt.md`.
-
 ---
 
 ## Out-of-Branch Git Checkpoints
@@ -758,5 +791,3 @@ freeze it, `commit-tree` to wrap it in a commit, and `update-ref` to park that c
 `refs/<app>/checkpoints/<id>/turn/<n>`. Diff two such refs (`git diff <refA> <refB>`) to get
 a turn's file changes, and reset the working tree to a ref to undo. Because nothing lands on
 a real branch, the user's history stays clean and the checkpoints are trivially disposable.
-
-> Source: t3code `vcs/GitVcsDriver.ts`.

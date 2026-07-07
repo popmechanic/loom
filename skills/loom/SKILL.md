@@ -180,11 +180,14 @@ Web apps add security concerns that CLIs don't have:
 
 | Need | Model | Why |
 |------|-------|-----|
-| Fast responses (<3s) | `haiku` | Classification, extraction, routing (Haiku 4.5) |
-| Good quality, reasonable speed | `sonnet` | Default for most apps (Sonnet 4.6) |
-| Best reasoning | `opus` | Complex analysis, code generation (Opus 4.8) |
-| Hardest agentic work | `fable` | Most capable (Fable 5) — enable when available on your plan |
-| Reliability | `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order) |
+| Fast responses (<3s) | `haiku` | Classification, extraction, routing |
+| Good quality, reasonable speed | `sonnet` | Default for most apps |
+| Best reasoning | `opus` | Complex analysis, code generation |
+| Hardest agentic work | `fable` | Most capable — enable when available on your plan |
+| Reliability | `--fallback-model sonnet,haiku` | Auto-fallback on overload (comma-separated, tried in order; print-mode only) |
+
+Aliases resolve to the latest generation of each tier — prefer them over
+pinned model IDs, which go stale as new generations ship.
 
 Reasoning depth is a separate axis from model choice: `--effort` takes
 `low | medium | high | xhigh | max`. `xhigh` is Claude Code's own default for
@@ -204,10 +207,15 @@ Default to **Node.js/TypeScript** with **Express** for the server and plain
 
 Loom spawns the `claude -p` CLI rather than calling the Claude Agent SDK
 (`@anthropic-ai/claude-agent-sdk`) as a library, and the reason is authentication.
-The CLI authenticates with the user's Claude **subscription** via OAuth: `claude
-setup-token` mints a one-year `CLAUDE_CODE_OAUTH_TOKEN` scoped to inference, and the
-server injects each user's token into their own spawned process (see Authentication
-Setup). No API key, no per-call billing — every user brings their own subscription.
+The CLI authenticates with the user's Claude **subscription** via OAuth through the
+`CLAUDE_CODE_OAUTH_TOKEN` env var, and the server injects each user's token into
+their own spawned process. For a deployed multi-user app, those tokens come from
+the in-app PKCE flow in `references/oauth-reference.md` — short-lived access tokens
+with rotating refresh tokens, which is why the server refreshes before every spawn
+(see Authentication Setup). (`claude setup-token` also mints a one-year
+inference-scoped token, but it's an interactive terminal flow — right for a
+single-user tool or CI, not something a web app can run for its users.) No API
+key, no per-call billing — every user brings their own subscription.
 
 The Agent SDK, used as a library, authenticates only with `ANTHROPIC_API_KEY`, and
 Anthropic's policy is explicit that third-party products built on the SDK should not
@@ -266,16 +274,23 @@ Read `references/cli-runtime-reference.md` for the full `claude -p` flag referen
 #### Safety Defaults
 
 Every pattern runs Claude in a server — no human sitting at a terminal
-to approve tool use. Three flags are non-negotiable:
+to approve tool use. These defaults are non-negotiable:
 
 **`--permission-mode dontAsk`** — In a server context, there's nobody to click
-"approve." Without this flag, Claude hangs forever waiting for interactive
-input. `dontAsk` auto-denies any tool not in `--allowedTools`, which is exactly
-what you want: predictable, unattended execution.
+"approve." Print mode never shows an interactive prompt: a tool call that would
+need approval is auto-denied, and in the default mode Claude responds by
+*asking for permission* in its result text — a dead-end question no one can
+answer. `dontAsk` tells Claude the denial is final, so it works within the
+allowed tools or reports plainly that it couldn't: predictable, unattended
+execution.
 
-**Critical:** Pair `--permission-mode dontAsk` with `--allowedTools` or `--tools`.
-Without allowed tools, `dontAsk` gives Claude no tools at all — it can reason
-but can't act, and the failure is silent (no error, just missing results).
+**Pair it with `--allowedTools` or `--tools`.** Under `dontAsk`, read-only
+tools (Read, Glob, Grep) still work — they never need approval — but anything
+that writes or shells out (Write, Edit, Bash) is auto-denied unless explicitly
+allowed. The run then finishes with `is_error: false` and the work not done.
+Detect this server-side: every denial lands in the result event's
+`permission_denials` array (`{tool_name, tool_use_id, tool_input}`) — log it
+and surface a warning instead of treating an empty-handed result as success.
 
 **`--max-turns`** — Prevents
 conversational loops where Claude keeps trying approaches that won't work.
@@ -287,12 +302,21 @@ spend. For a server running Claude processes nobody is watching, set both so a
 runaway task can't burn turns *or* budget. Print-mode only — silently ignored
 outside `-p`.
 
+**Isolate the spawn from the host.** A spawned `claude -p` inherits the server
+account's user-level configuration by default — CLAUDE.md, hooks, plugins, MCP
+servers. Whatever happens to be installed on the box quietly becomes part of
+your app. Pass `--setting-sources ""` (app-owned config still loads via
+`--settings`), and set `cwd` on every spawn to a per-user or per-run directory
+so users can't read each other's files. See
+`references/server-patterns.md#spawn-isolation`.
+
 Every pattern also handles three failure modes:
 
 - **stderr** — Claude writes warnings, errors, and diagnostics here. Always
   capture it; it's your best debugging signal when something goes wrong.
 - **Non-zero exit codes** — Model overloaded, permission denied, timeout hit.
-  `execFileSync` throws; `spawn` emits a `close` event.
+  Listen on the `close` event and check the code (all patterns spawn
+  asynchronously — a synchronous spawn would freeze the whole server).
 - **Malformed output** — A killed or timed-out process may emit partial JSON.
   Always wrap JSON.parse in try/catch and check `parsed.is_error` before
   using `structured_output`.
@@ -336,13 +360,17 @@ Claude emits newline-delimited JSON events:
 
 | Event Type | Shape | Forward? |
 |------------|-------|----------|
-| `system` | `{type:"system", subtype:"init", session_id, model, tools}` | Optional (extract session_id) |
+| `system` | `{type:"system", subtype:"init"|"compact_boundary"|…, session_id, model, tools}` | Optional (extract session_id from `init`) |
 | `stream_event` | `{type:"stream_event", event:{delta:{text:"..."}}}` | Yes (live text) |
 | `assistant` | `{type:"assistant", message:{content:[...]}}` | Tool use only (text already streamed) |
-| `tool_result` | `{type:"tool_result", tool_name, content, is_error}` | Optional |
-| `compact` | `{type:"compact"}` | No (internal) |
+| `user` | `{type:"user", message:{content:[{type:"tool_result", tool_use_id, content}]}}` | Optional (tool outcomes — match `tool_use_id` to the earlier `tool_use` block's `id`) |
 | `rate_limit_event` | `{type:"rate_limit_event", rate_limit_info:{...}}` | No (log it) |
-| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error}` | Yes (done signal) |
+| `result` | `{type:"result", subtype:"success"|"error_max_turns", is_error, permission_denials}` | Yes (done signal) |
+
+There is no top-level `tool_result` event type — tool results arrive as `user`
+messages containing `tool_result` content blocks, and those blocks carry only
+`tool_use_id` (never the tool name). Ignore unrecognized `system` subtypes
+(`status`, `thinking_tokens`, `hook_started`, …) rather than erroring.
 
 > See `references/server-patterns.md#stream-json-event-types` for complete notes,
 > extended thinking behavior, code samples for extracting text/tool use, and
@@ -371,8 +399,7 @@ debugging signal when a request fails silently.
 **Non-zero exit codes** mean Claude didn't complete successfully. Common
 causes: model overloaded (503 from upstream), permission denied (tool not
 in `--allowedTools`), or process killed
-by your timeout. For `execFileSync`, this throws — catch it. For `spawn`,
-listen on the `close` event and check the code.
+by your timeout. Listen on the `close` event and check the code.
 
 **Malformed output** happens when a process is killed mid-stream (timeout,
 client disconnect, OOM). The stdout buffer contains partial JSON that won't
@@ -420,8 +447,8 @@ for each, but they're easy to miss or deviate from when generating a new app.
 
 - [ ] `--include-partial-messages` is on every streaming spawn — without it, text dumps as a single block instead of streaming token-by-token
 - [ ] Text is forwarded from `stream_event` only, NOT from `assistant` text blocks — otherwise every token appears twice
-- [ ] `spawnEnvForUser()` is called on every `spawn`/`execFileSync` — this removes nesting guards AND injects the user's OAuth token; bare `cleanEnv()` omits the token and causes silent auth failure
-- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — without allowed tools, Claude produces an empty result with NO error
+- [ ] `spawnEnvForUser()` is called on every spawn — this removes nesting guards AND injects the user's OAuth token; bare `cleanEnv()` omits the token and causes silent auth failure
+- [ ] `--permission-mode dontAsk` is paired with `--allowedTools` or `--tools` — write/exec tools are otherwise auto-denied while the run still ends `is_error: false`; check `result.permission_denials` to catch it
 - [ ] `subtype === "error_max_turns"` is checked **before** `is_error` on result events — max-turns sets `is_error: true` (verified on CLI v2.1.x), so an `if (is_error) … else if (subtype === …)` ordering makes the max-turns branch dead code and surfaces "incomplete" as a hard error
 - [ ] `express.json()` middleware is applied before any route that reads `req.body` — without it, `req.body` is `undefined` and the spawn gets an empty prompt
 - [ ] 401 responses in the frontend redirect to the setup screen — in-memory sessions are wiped on server restart, and a 401 fed to the SSE parser fails silently
